@@ -18,7 +18,44 @@ TraceBench is local-first and designed to work without paid services.
 
 ## Development status
 
-TraceBench is in initial setup. The V0.1 interface and implementation have not been released yet.
+TraceBench currently supports importing application traces into a local SQLite
+database and listing the stored traces.
+
+## Trace ingestion
+
+Import newline-delimited JSON traces from the repository's sample dataset:
+
+```powershell
+tracebench ingest datasets/traces.sample.jsonl
+```
+
+Each input line must contain one JSON trace object. Invalid records are reported
+with their line numbers and skipped, while valid records continue to be stored.
+Duplicate `trace_id` values are also skipped. The command prints:
+
+```text
+Records read: N
+Records accepted: N
+Invalid records: N
+Duplicates skipped: N
+Records stored: N
+```
+
+List stored traces in newest-first order:
+
+```powershell
+tracebench traces list
+```
+
+By default, TraceBench stores data in `.tracebench/tracebench.sqlite3` relative
+to the current directory. Override the location for tests or local workflows
+with `TRACEBENCH_DB_PATH`:
+
+```powershell
+$env:TRACEBENCH_DB_PATH = "C:\path\to\tracebench.sqlite3"
+tracebench ingest datasets/traces.sample.jsonl
+tracebench traces list
+```
 
 ## Local installation
 
