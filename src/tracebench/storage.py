@@ -7,12 +7,22 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
-from tracebench.models import Trace
+from tracebench.models import EvalCase, EvalDataset, ScorerConfig, Trace
 
 DATABASE_PATH_ENV = "TRACEBENCH_DB_PATH"
 DEFAULT_DATABASE_PATH = Path(".tracebench") / "tracebench.sqlite3"
 
-SCHEMA = """
+# SQLite's one-argument trim() removes only U+0020, while Python's str.strip()
+# recognizes this full set. Use the same characters in schema constraints so a
+# direct SQL write cannot create selectors that Python later canonicalizes.
+_SQLITE_PYTHON_WHITESPACE = (
+    "char(9,10,11,12,13,28,29,30,31,32,133,160,5760,"
+    "8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,"
+    "8232,8233,8239,8287,12288)"
+)
+
+SCHEMA_STATEMENTS = (
+    """
 CREATE TABLE IF NOT EXISTS traces (
     trace_id TEXT PRIMARY KEY CHECK (length(trim(trace_id)) > 0),
     timestamp TEXT NOT NULL,
@@ -21,11 +31,157 @@ CREATE TABLE IF NOT EXISTS traces (
     response TEXT,
     context_json TEXT NOT NULL DEFAULT '{}',
     metadata_json TEXT NOT NULL DEFAULT '{}'
-);
-
+)
+""",
+    """
 CREATE INDEX IF NOT EXISTS idx_traces_timestamp_trace_id
-ON traces (timestamp DESC, trace_id ASC);
+ON traces (timestamp DESC, trace_id ASC)
+""",
+    f"""
+CREATE TABLE IF NOT EXISTS eval_datasets (
+    dataset_id TEXT PRIMARY KEY CHECK (length(trim(dataset_id)) > 0),
+    name TEXT NOT NULL
+        CHECK (
+            length(name) > 0
+            AND name = trim(name, {_SQLITE_PYTHON_WHITESPACE})
+            AND instr(name, ':') = 0
+        ),
+    version TEXT NOT NULL
+        CHECK (
+            length(version) > 0
+            AND version = trim(version, {_SQLITE_PYTHON_WHITESPACE})
+            AND instr(version, ':') = 0
+        ),
+    description TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (name, version)
+)
+""",
+    """
+CREATE TABLE IF NOT EXISTS eval_cases (
+    eval_id TEXT PRIMARY KEY CHECK (length(trim(eval_id)) > 0),
+    dataset_id TEXT NOT NULL
+        REFERENCES eval_datasets(dataset_id) ON DELETE CASCADE,
+    source_trace_id TEXT NOT NULL
+        REFERENCES traces(trace_id) ON DELETE RESTRICT,
+    source_timestamp TEXT NOT NULL,
+    source_task_type TEXT NOT NULL
+        CHECK (length(trim(source_task_type)) > 0),
+    source_response TEXT,
+    source_metadata_json TEXT NOT NULL
+        CHECK (
+            json_valid(source_metadata_json)
+            AND json_type(source_metadata_json) = 'object'
+        ),
+    input TEXT NOT NULL CHECK (length(trim(input)) > 0),
+    context_json TEXT NOT NULL
+        CHECK (json_valid(context_json) AND json_type(context_json) = 'object'),
+    evaluation_mode TEXT NOT NULL
+        CHECK (evaluation_mode IN ('deterministic', 'reference', 'rubric')),
+    reference_answer TEXT,
+    rubric_json TEXT NOT NULL
+        CHECK (json_valid(rubric_json) AND json_type(rubric_json) = 'array'),
+    scorers_json TEXT NOT NULL
+        CHECK (json_valid(scorers_json) AND json_type(scorers_json) = 'array'),
+    priority TEXT NOT NULL
+        CHECK (priority IN ('low', 'medium', 'high', 'critical')),
+    review_status TEXT NOT NULL
+        CHECK (review_status IN ('draft', 'approved', 'rejected')),
+    created_at TEXT NOT NULL,
+    UNIQUE (dataset_id, source_trace_id),
+    CHECK (
+        (
+            evaluation_mode = 'deterministic'
+            AND source_response IS NULL
+            AND reference_answer IS NULL
+            AND json_array_length(rubric_json) = 0
+            AND json_array_length(scorers_json) > 0
+        )
+        OR (
+            evaluation_mode = 'reference'
+            AND
+            reference_answer IS NOT NULL
+            AND length(trim(reference_answer)) > 0
+            AND json_array_length(rubric_json) = 0
+            AND json_array_length(scorers_json) = 0
+        )
+        OR (
+            evaluation_mode = 'rubric'
+            AND source_response IS NULL
+            AND reference_answer IS NULL
+            AND json_array_length(rubric_json) > 0
+            AND json_array_length(scorers_json) = 0
+        )
+    )
+)
+""",
+    """
+CREATE INDEX IF NOT EXISTS idx_eval_cases_dataset_eval
+ON eval_cases (dataset_id, eval_id ASC)
+    """,
+)
+
+_EVAL_CASE_JSON_VALIDATION = f"""
+    SELECT CASE WHEN EXISTS (
+        SELECT 1
+        FROM json_each(NEW.rubric_json)
+        WHERE type != 'text'
+            OR length(
+                trim(CAST(value AS TEXT), {_SQLITE_PYTHON_WHITESPACE})
+            ) = 0
+    ) THEN RAISE(ABORT, 'rubric_json must contain nonblank strings') END;
+    SELECT CASE WHEN (
+        SELECT COUNT(*) FROM json_each(NEW.rubric_json)
+    ) != (
+        SELECT COUNT(DISTINCT trim(
+            CAST(value AS TEXT), {_SQLITE_PYTHON_WHITESPACE}
+        ))
+        FROM json_each(NEW.rubric_json)
+    ) THEN RAISE(ABORT, 'rubric_json must not contain duplicates') END;
+    SELECT CASE WHEN EXISTS (
+        SELECT 1
+        FROM json_each(NEW.scorers_json) AS scorer
+        WHERE scorer.type != 'object'
+            OR json_type(scorer.value, '$.name') IS NOT 'text'
+            OR length(trim(
+                json_extract(scorer.value, '$.name'),
+                {_SQLITE_PYTHON_WHITESPACE}
+            )) = 0
+            OR (
+                json_type(scorer.value, '$.config') IS NOT NULL
+                AND json_type(scorer.value, '$.config') != 'object'
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM json_each(scorer.value) AS field
+                WHERE field.key NOT IN ('name', 'config')
+            )
+    ) THEN RAISE(ABORT, 'scorers_json contains an invalid scorer') END;
 """
+
+EVAL_CASE_TRIGGER_STATEMENTS = (
+    f"""
+CREATE TRIGGER IF NOT EXISTS validate_eval_case_json_insert
+BEFORE INSERT ON eval_cases
+BEGIN
+{_EVAL_CASE_JSON_VALIDATION}
+END
+""",
+    f"""
+CREATE TRIGGER IF NOT EXISTS validate_eval_case_json_update
+BEFORE UPDATE ON eval_cases
+BEGIN
+{_EVAL_CASE_JSON_VALIDATION}
+END
+""",
+)
+
+REQUIRED_EVAL_CASE_COLUMNS = {
+    "source_timestamp",
+    "source_task_type",
+    "source_response",
+    "source_metadata_json",
+}
 
 
 def resolve_database_path() -> Path:
@@ -47,8 +203,19 @@ def connect_database(database_path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(database_path)
     try:
         connection.row_factory = sqlite3.Row
-        connection.executescript(SCHEMA)
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("BEGIN")
+        for statement in SCHEMA_STATEMENTS:
+            connection.execute(statement)
+        _ensure_eval_schema_compatible(connection)
+        for statement in EVAL_CASE_TRIGGER_STATEMENTS:
+            connection.execute(statement)
+        connection.commit()
     except BaseException:
+        try:
+            connection.rollback()
+        except BaseException:
+            pass
         try:
             connection.close()
         except BaseException:
@@ -126,7 +293,180 @@ def list_traces(connection: sqlite3.Connection) -> list[Trace]:
     ]
 
 
+def get_trace(connection: sqlite3.Connection, trace_id: str) -> Trace | None:
+    """Return one trace by identifier, or ``None`` when it is absent."""
+    row = connection.execute(
+        """
+        SELECT
+            trace_id,
+            timestamp,
+            task_type,
+            prompt,
+            response,
+            context_json,
+            metadata_json
+        FROM traces
+        WHERE trace_id = ?
+        """,
+        (trace_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return Trace.model_validate(
+        {
+            "trace_id": row["trace_id"],
+            "timestamp": row["timestamp"],
+            "task_type": row["task_type"],
+            "prompt": row["prompt"],
+            "response": row["response"],
+            "context": _decode_object(row["context_json"]),
+            "metadata": _decode_object(row["metadata_json"]),
+        }
+    )
+
+
+def insert_eval_dataset(connection: sqlite3.Connection, dataset: EvalDataset) -> bool:
+    """Insert a dataset, returning whether its name/version was new."""
+    cursor = connection.execute(
+        """
+        INSERT INTO eval_datasets (
+            dataset_id,
+            name,
+            version,
+            description,
+            created_at
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(name, version) DO NOTHING
+        """,
+        (
+            dataset.dataset_id,
+            dataset.name,
+            dataset.version,
+            dataset.description,
+            timestamp_to_text(dataset.created_at),
+        ),
+    )
+    return cursor.rowcount == 1
+
+
+def get_eval_dataset(
+    connection: sqlite3.Connection, name: str, version: str
+) -> EvalDataset | None:
+    """Return a dataset by its human-readable name and version."""
+    row = connection.execute(
+        """
+        SELECT dataset_id, name, version, description, created_at
+        FROM eval_datasets
+        WHERE name = ? AND version = ?
+        """,
+        (name.strip(), version.strip()),
+    ).fetchone()
+    return _dataset_from_row(row) if row is not None else None
+
+
+def list_eval_datasets(
+    connection: sqlite3.Connection,
+) -> list[tuple[EvalDataset, int]]:
+    """Return datasets and their case counts in deterministic order."""
+    rows = connection.execute(
+        """
+        SELECT
+            d.dataset_id,
+            d.name,
+            d.version,
+            d.description,
+            d.created_at,
+            COUNT(c.eval_id) AS case_count
+        FROM eval_datasets AS d
+        LEFT JOIN eval_cases AS c ON c.dataset_id = d.dataset_id
+        GROUP BY d.dataset_id
+        ORDER BY d.name ASC, d.version ASC
+        """
+    ).fetchall()
+    return [(_dataset_from_row(row), int(row["case_count"])) for row in rows]
+
+
+def insert_eval_case(connection: sqlite3.Connection, case: EvalCase) -> bool:
+    """Insert a case, returning whether the trace membership was new."""
+    cursor = connection.execute(
+        """
+        INSERT INTO eval_cases (
+            eval_id,
+            dataset_id,
+            source_trace_id,
+            source_timestamp,
+            source_task_type,
+            source_response,
+            source_metadata_json,
+            input,
+            context_json,
+            evaluation_mode,
+            reference_answer,
+            rubric_json,
+            scorers_json,
+            priority,
+            review_status,
+            created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(dataset_id, source_trace_id) DO NOTHING
+        """,
+        (
+            case.eval_id,
+            case.dataset_id,
+            case.source_trace_id,
+            timestamp_to_text(case.source_timestamp),
+            case.source_task_type,
+            case.source_response,
+            _encode_object(case.source_metadata),
+            case.input,
+            _encode_object(case.context),
+            case.evaluation_mode.value,
+            case.reference_answer,
+            _encode_json(case.rubric),
+            _encode_json([scorer.model_dump(mode="json") for scorer in case.scorers]),
+            case.priority.value,
+            case.review_status.value,
+            timestamp_to_text(case.created_at),
+        ),
+    )
+    return cursor.rowcount == 1
+
+
+def list_eval_cases(connection: sqlite3.Connection, dataset_id: str) -> list[EvalCase]:
+    """Return a dataset's evaluation cases in stable identity order."""
+    rows = connection.execute(
+        """
+        SELECT
+            eval_id,
+            dataset_id,
+            source_trace_id,
+            source_timestamp,
+            source_task_type,
+            source_response,
+            source_metadata_json,
+            input,
+            context_json,
+            evaluation_mode,
+            reference_answer,
+            rubric_json,
+            scorers_json,
+            priority,
+            review_status,
+            created_at
+        FROM eval_cases
+        WHERE dataset_id = ?
+        ORDER BY eval_id ASC
+        """,
+        (dataset_id,),
+    ).fetchall()
+    return [_case_from_row(row) for row in rows]
+
+
 def _encode_object(value: dict[str, Any]) -> str:
+    return _encode_json(value)
+
+
+def _encode_json(value: object) -> str:
     return json.dumps(
         value,
         allow_nan=False,
@@ -141,3 +481,74 @@ def _decode_object(value: str) -> dict[str, Any]:
     if not isinstance(decoded, dict):
         raise ValueError("stored trace data is not a JSON object")
     return cast(dict[str, Any], decoded)
+
+
+def _decode_list(value: str) -> list[Any]:
+    decoded = json.loads(value)
+    if not isinstance(decoded, list):
+        raise ValueError("stored evaluation data is not a JSON array")
+    return decoded
+
+
+def _dataset_from_row(row: sqlite3.Row) -> EvalDataset:
+    return EvalDataset.model_validate(
+        {
+            "dataset_id": row["dataset_id"],
+            "name": row["name"],
+            "version": row["version"],
+            "description": row["description"],
+            "created_at": row["created_at"],
+        }
+    )
+
+
+def _case_from_row(row: sqlite3.Row) -> EvalCase:
+    return EvalCase.model_validate(
+        {
+            "eval_id": row["eval_id"],
+            "dataset_id": row["dataset_id"],
+            "source_trace_id": row["source_trace_id"],
+            "source_timestamp": row["source_timestamp"],
+            "source_task_type": row["source_task_type"],
+            "source_response": row["source_response"],
+            "source_metadata": _decode_object(row["source_metadata_json"]),
+            "input": row["input"],
+            "context": _decode_object(row["context_json"]),
+            "evaluation_mode": row["evaluation_mode"],
+            "reference_answer": row["reference_answer"],
+            "rubric": _decode_list(row["rubric_json"]),
+            "scorers": [
+                ScorerConfig.model_validate(scorer)
+                for scorer in _decode_list(row["scorers_json"])
+            ],
+            "priority": row["priority"],
+            "review_status": row["review_status"],
+            "created_at": row["created_at"],
+        }
+    )
+
+
+def _ensure_eval_schema_compatible(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row["name"])
+        for row in connection.execute("PRAGMA table_info(eval_cases)").fetchall()
+    }
+    dataset_schema = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'eval_datasets'"
+    ).fetchone()
+    case_schema = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'eval_cases'"
+    ).fetchone()
+    required_dataset_constraint = f"trim(name, {_SQLITE_PYTHON_WHITESPACE})"
+    if (
+        not REQUIRED_EVAL_CASE_COLUMNS.issubset(columns)
+        or dataset_schema is None
+        or required_dataset_constraint not in str(dataset_schema["sql"])
+        or case_schema is None
+        or "source_response IS NULL" not in str(case_schema["sql"])
+    ):
+        raise sqlite3.DatabaseError(
+            "evaluation dataset schema predates provenance snapshots or final "
+            "integrity constraints; "
+            "recreate this unmerged development database"
+        )
