@@ -1,0 +1,3 @@
+{"trace_id":"sample-001","timestamp":"2026-07-28T14:00:00Z","task_type":"question-answering","prompt":"What is the capital of Canada?","response":"Ottawa","context":{"locale":"en-CA"},"metadata":{"source":"sample"}}
+{"trace_id":"sample-002","timestamp":"2026-07-28T14:05:00-04:00","task_type":"summarization","prompt":"Summarize the supplied release notes.","response":"The release improves trace ingestion.","context":{"document_id":"release-001"}}
+{"trace_id":"sample-003","timestamp":"2026-07-28T19:00:00Z","task_type":"classification","prompt":"Classify this feedback as positive or negative."}
