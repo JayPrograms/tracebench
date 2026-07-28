@@ -6,7 +6,7 @@
 
 ## Project conventions
 
-- Use Python 3.12.
+- Use Python 3.13.
 - Use a `src` layout for Python packages.
 - Keep TraceBench local-first and functional without paid services.
 - Use Typer for the CLI, Pydantic for data validation, the standard-library `sqlite3` module for persistence, pytest for tests, Ruff for linting and formatting, and mypy for static type checking.

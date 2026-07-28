@@ -19,3 +19,31 @@ TraceBench is local-first and designed to work without paid services.
 ## Development status
 
 TraceBench is in initial setup. The V0.1 interface and implementation have not been released yet.
+
+## Local installation
+
+TraceBench requires Python 3.13. From the repository root, activate the existing
+virtual environment and install the package with its development dependencies:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+python --version
+python -m pip install -e ".[dev]"
+```
+
+The Python version should be `3.13.x`. Verify the installed CLI:
+
+```powershell
+tracebench version
+```
+
+## Validation
+
+Run formatting, linting, type checking, and tests from the repository root:
+
+```powershell
+ruff format --check .
+ruff check .
+mypy src
+pytest
+```
