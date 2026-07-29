@@ -181,7 +181,8 @@ CREATE TABLE IF NOT EXISTS experiment_runs (
     experiment_id TEXT NOT NULL
         REFERENCES experiments(experiment_id) ON DELETE CASCADE,
     role TEXT NOT NULL CHECK (role IN ('baseline', 'candidate')),
-    provider_name TEXT NOT NULL CHECK (provider_name = 'fixture'),
+    provider_name TEXT NOT NULL
+        CHECK (provider_name IN ('fixture', 'ollama')),
     provider_config_json TEXT NOT NULL
         CHECK (
             json_valid(provider_config_json)
@@ -238,6 +239,12 @@ CREATE TABLE IF NOT EXISTS experiment_case_results (
     output TEXT NOT NULL,
     score REAL NOT NULL CHECK (score >= 0.0 AND score <= 1.0),
     passed INTEGER NOT NULL CHECK (passed IN (0, 1)),
+    generation_latency_ms REAL CHECK (generation_latency_ms >= 0.0),
+    provider_metadata_json TEXT NOT NULL DEFAULT '{}'
+        CHECK (
+            json_valid(provider_metadata_json)
+            AND json_type(provider_metadata_json) = 'object'
+        ),
     created_at TEXT NOT NULL,
     PRIMARY KEY (run_id, eval_id)
 )
@@ -476,17 +483,29 @@ def connect_database(database_path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(database_path)
     try:
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
+        # Schema migrations may rebuild a referenced table. A new sqlite3
+        # connection starts with foreign keys disabled, so keep them disabled
+        # only for this transaction and verify all relationships before commit.
+        connection.execute("PRAGMA foreign_keys = OFF")
         connection.execute("BEGIN")
         for statement in SCHEMA_STATEMENTS:
             connection.execute(statement)
         _ensure_eval_schema_compatible(connection)
+        _migrate_experiment_schema(connection)
         for statement in (
             *EVAL_CASE_TRIGGER_STATEMENTS,
             *EXPERIMENT_TRIGGER_STATEMENTS,
         ):
             connection.execute(statement)
+        foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if foreign_key_errors:
+            first = foreign_key_errors[0]
+            raise sqlite3.DatabaseError(
+                "database schema migration failed foreign-key validation: "
+                f"table={first[0]}, rowid={first[1]}, parent={first[2]}"
+            )
         connection.commit()
+        connection.execute("PRAGMA foreign_keys = ON")
     except BaseException:
         try:
             connection.rollback()
@@ -828,3 +847,89 @@ def _ensure_eval_schema_compatible(connection: sqlite3.Connection) -> None:
             "integrity constraints; "
             "recreate this unmerged development database"
         )
+
+
+def _migrate_experiment_schema(connection: sqlite3.Connection) -> None:
+    """Upgrade the pre-local-provider experiment schema without losing rows."""
+    run_schema_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'experiment_runs'"
+    ).fetchone()
+    if run_schema_row is None:
+        raise sqlite3.DatabaseError("experiment_runs schema is missing")
+    run_schema = str(run_schema_row["sql"])
+    if "provider_name IN ('fixture', 'ollama')" not in run_schema:
+        _rebuild_experiment_runs(connection)
+
+    result_columns = {
+        str(row["name"])
+        for row in connection.execute(
+            "PRAGMA table_info(experiment_case_results)"
+        ).fetchall()
+    }
+    if "generation_latency_ms" not in result_columns:
+        connection.execute(
+            """
+            ALTER TABLE experiment_case_results
+            ADD COLUMN generation_latency_ms REAL
+                CHECK (generation_latency_ms >= 0.0)
+            """
+        )
+    if "provider_metadata_json" not in result_columns:
+        connection.execute(
+            """
+            ALTER TABLE experiment_case_results
+            ADD COLUMN provider_metadata_json TEXT NOT NULL DEFAULT '{}'
+                CHECK (
+                    json_valid(provider_metadata_json)
+                    AND json_type(provider_metadata_json) = 'object'
+                )
+            """
+        )
+
+
+def _rebuild_experiment_runs(connection: sqlite3.Connection) -> None:
+    """Replace the fixture-only provider constraint while preserving runs."""
+    # These child-table triggers query experiment_runs. SQLite validates their
+    # bodies during the table swap, so recreate them after the migration.
+    connection.execute(
+        "DROP TRIGGER IF EXISTS validate_experiment_result_relation_insert"
+    )
+    connection.execute(
+        "DROP TRIGGER IF EXISTS validate_experiment_result_relation_update"
+    )
+    run_statement = next(
+        (
+            statement
+            for statement in SCHEMA_STATEMENTS
+            if "CREATE TABLE IF NOT EXISTS experiment_runs (" in statement
+        ),
+        None,
+    )
+    if run_statement is None:
+        raise sqlite3.DatabaseError("current experiment_runs schema is missing")
+    migration_statement = run_statement.replace(
+        "CREATE TABLE IF NOT EXISTS experiment_runs (",
+        "CREATE TABLE experiment_runs_migration (",
+        1,
+    )
+    connection.execute("DROP TABLE IF EXISTS experiment_runs_migration")
+    connection.execute(migration_statement)
+    connection.execute(
+        """
+        INSERT INTO experiment_runs_migration (
+            run_id, experiment_id, role, provider_name,
+            provider_config_json, status, error_message,
+            started_at, completed_at
+        )
+        SELECT
+            run_id, experiment_id, role, provider_name,
+            provider_config_json, status, error_message,
+            started_at, completed_at
+        FROM experiment_runs
+        """
+    )
+    connection.execute("DROP TABLE experiment_runs")
+    connection.execute(
+        "ALTER TABLE experiment_runs_migration RENAME TO experiment_runs"
+    )

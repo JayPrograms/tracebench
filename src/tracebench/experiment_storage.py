@@ -17,11 +17,13 @@ from tracebench.experiment_models import (
     GateMetric,
     GateReport,
     GateViolation,
+    GenerationDetails,
     RunAggregate,
     RunReport,
     RunRole,
     ScorerResult,
 )
+from tracebench.providers import JsonValue
 from tracebench.storage import timestamp_to_text
 
 
@@ -34,7 +36,7 @@ def insert_attempt(
     configuration_hash: str,
     configuration_json: str,
     run_ids: dict[RunRole, str],
-    provider_snapshots: dict[RunRole, dict[str, str]],
+    provider_snapshots: dict[RunRole, dict[str, JsonValue]],
     timestamp: datetime,
 ) -> None:
     """Insert one running attempt and its two pending run records."""
@@ -58,19 +60,24 @@ def insert_attempt(
         ),
     )
     for role in RunRole:
+        snapshot = provider_snapshots[role]
+        provider_name = snapshot.get("provider")
+        if not isinstance(provider_name, str) or not provider_name.strip():
+            raise ValueError(f"provider snapshot for {role.value} has no provider")
         connection.execute(
             """
             INSERT INTO experiment_runs (
                 run_id, experiment_id, role, provider_name,
                 provider_config_json, status, error_message,
                 started_at, completed_at
-            ) VALUES (?, ?, ?, 'fixture', ?, 'pending', NULL, NULL, NULL)
+            ) VALUES (?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL)
             """,
             (
                 run_ids[role],
                 experiment_id,
                 role.value,
-                _encode_json(provider_snapshots[role]),
+                provider_name,
+                _encode_json(snapshot),
             ),
         )
 
@@ -98,18 +105,24 @@ def persist_completed_run(
     *,
     run_id: str,
     results: list[CaseResult],
+    generation_details: dict[str, GenerationDetails],
     aggregates: list[RunAggregate],
     timestamp: datetime,
 ) -> None:
     """Atomically insert all normalized run rows and complete the run."""
+    result_ids = {result.eval_id for result in results}
+    if result_ids != set(generation_details):
+        raise ValueError("generation details do not match run results")
     created_at = timestamp_to_text(timestamp)
     for result in results:
+        details = generation_details[result.eval_id]
         connection.execute(
             """
             INSERT INTO experiment_case_results (
                 run_id, eval_id, evaluation_mode, output,
-                score, passed, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                score, passed, generation_latency_ms,
+                provider_metadata_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id,
@@ -118,6 +131,8 @@ def persist_completed_run(
                 result.output,
                 result.score,
                 int(result.passed),
+                details.latency_ms,
+                _encode_json(details.provider_metadata),
                 created_at,
             ),
         )

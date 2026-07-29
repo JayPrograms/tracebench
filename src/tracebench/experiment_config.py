@@ -15,10 +15,19 @@ from tracebench.datasets import DatasetError, get_dataset_and_cases
 from tracebench.experiment_models import (
     EffectiveThresholds,
     ExperimentConfig,
+    FixtureProviderConfig,
+    OllamaProviderConfig,
     RunRole,
 )
 from tracebench.models import EvalCase, EvalDataset, EvaluationMode
-from tracebench.providers import ProviderError, load_fixture
+from tracebench.providers import (
+    FixtureProvider,
+    JsonValue,
+    OllamaProvider,
+    Provider,
+    ProviderError,
+    load_fixture,
+)
 from tracebench.scorers import ScorerConfigurationError, validate_case_scorers
 
 
@@ -72,11 +81,11 @@ class PreparedExperiment:
     config: ExperimentConfig
     dataset: EvalDataset
     cases: tuple[EvalCase, ...]
-    outputs: dict[RunRole, dict[str, str]]
+    providers: dict[RunRole, Provider]
     effective_thresholds: dict[str, EffectiveThresholds]
     configuration_hash: str
     configuration_json: str
-    provider_snapshots: dict[RunRole, dict[str, str]]
+    provider_snapshots: dict[RunRole, dict[str, JsonValue]]
 
 
 def prepare_experiment(
@@ -124,42 +133,79 @@ def prepare_experiment(
 
     expected_ids = {case.eval_id for case in cases}
     config_parent = config_path.resolve().parent
-    outputs: dict[RunRole, dict[str, str]] = {}
+    providers: dict[RunRole, Provider] = {}
+    provider_snapshots: dict[RunRole, dict[str, JsonValue]] = {}
+    canonical_providers: dict[RunRole, dict[str, JsonValue]] = {}
     for role, provider_config in (
         (RunRole.BASELINE, config.baseline),
         (RunRole.CANDIDATE, config.candidate),
     ):
-        path = provider_config.path
-        if not path.is_absolute():
-            path = config_parent / path
-        try:
-            outputs[role] = load_fixture(path.resolve(), expected_ids)
-        except ProviderError as error:
-            raise ExperimentPreflightError(str(error)) from error
+        if isinstance(provider_config, FixtureProviderConfig):
+            path = provider_config.path
+            if not path.is_absolute():
+                path = config_parent / path
+            try:
+                outputs = load_fixture(path.resolve(), expected_ids)
+            except ProviderError as error:
+                raise ExperimentPreflightError(str(error)) from error
+            providers[role] = FixtureProvider(outputs)
+            provider_snapshots[role] = {
+                "provider": "fixture",
+                "fixture_hash": hashlib.sha256(
+                    _encode_canonical(outputs).encode("utf-8")
+                ).hexdigest(),
+            }
+            canonical_outputs: dict[str, JsonValue] = {
+                eval_id: output for eval_id, output in outputs.items()
+            }
+            canonical_providers[role] = {
+                "provider": "fixture",
+                "outputs": canonical_outputs,
+            }
+        elif isinstance(provider_config, OllamaProviderConfig):
+            prompt_path = provider_config.system_prompt_file
+            if not prompt_path.is_absolute():
+                prompt_path = config_parent / prompt_path
+            system_prompt, system_prompt_hash = _load_system_prompt(
+                prompt_path.resolve()
+            )
+            providers[role] = OllamaProvider(
+                base_url=provider_config.base_url,
+                model=provider_config.model,
+                system_prompt=system_prompt,
+                temperature=provider_config.temperature,
+                timeout_seconds=provider_config.timeout_seconds,
+                seed=provider_config.seed,
+            )
+            snapshot: dict[str, JsonValue] = {
+                "provider": "ollama",
+                "base_url": provider_config.base_url,
+                "model": provider_config.model,
+                "prompt_version": provider_config.prompt_version,
+                "system_prompt_hash": system_prompt_hash,
+                "temperature": provider_config.temperature,
+                "timeout_seconds": provider_config.timeout_seconds,
+                "seed": provider_config.seed,
+            }
+            provider_snapshots[role] = snapshot
+            canonical_providers[role] = dict(snapshot)
+        else:
+            raise AssertionError("unreachable provider configuration")
 
     effective_thresholds = _effective_thresholds(config)
     canonical = _canonical_configuration(
         config=config,
         dataset=dataset,
         cases=cases,
-        outputs=outputs,
+        canonical_providers=canonical_providers,
         effective_thresholds=effective_thresholds,
     )
     configuration_json = _encode_canonical(canonical)
-    provider_snapshots = {
-        role: {
-            "provider": "fixture",
-            "fixture_hash": hashlib.sha256(
-                _encode_canonical(outputs[role]).encode("utf-8")
-            ).hexdigest(),
-        }
-        for role in RunRole
-    }
     return PreparedExperiment(
         config=config,
         dataset=dataset,
         cases=cases,
-        outputs=outputs,
+        providers=providers,
         effective_thresholds=effective_thresholds,
         configuration_hash=hashlib.sha256(
             configuration_json.encode("utf-8")
@@ -234,7 +280,7 @@ def _canonical_configuration(
     config: ExperimentConfig,
     dataset: EvalDataset,
     cases: tuple[EvalCase, ...],
-    outputs: dict[RunRole, dict[str, str]],
+    canonical_providers: dict[RunRole, dict[str, JsonValue]],
     effective_thresholds: dict[str, EffectiveThresholds],
 ) -> dict[str, object]:
     case_definitions = [
@@ -256,8 +302,8 @@ def _canonical_configuration(
             "version": dataset.version,
             "cases": case_definitions,
         },
-        "baseline": {"provider": "fixture", "outputs": outputs[RunRole.BASELINE]},
-        "candidate": {"provider": "fixture", "outputs": outputs[RunRole.CANDIDATE]},
+        "baseline": canonical_providers[RunRole.BASELINE],
+        "candidate": canonical_providers[RunRole.CANDIDATE],
         "gate": {
             scope: thresholds.model_dump(mode="json")
             for scope, thresholds in sorted(effective_thresholds.items())
@@ -273,3 +319,16 @@ def _encode_canonical(value: object) -> str:
         separators=(",", ":"),
         sort_keys=True,
     )
+
+
+def _load_system_prompt(path: Path) -> tuple[str, str]:
+    try:
+        contents = path.read_bytes().decode("utf-8-sig")
+    except (OSError, UnicodeError) as error:
+        raise ExperimentPreflightError(
+            f"could not read system prompt {path}: {error}"
+        ) from error
+    if not contents.strip():
+        raise ExperimentPreflightError(f"system prompt {path} must not be blank")
+    content_hash = hashlib.sha256(contents.encode("utf-8")).hexdigest()
+    return contents, content_hash

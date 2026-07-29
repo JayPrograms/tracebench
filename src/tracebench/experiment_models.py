@@ -1,8 +1,12 @@
 """Validated configuration and result models for experiment execution."""
 
+import re
+from dataclasses import dataclass
 from enum import StrEnum
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Annotated, Any, Literal, Self
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -41,6 +45,14 @@ class RunStatus(StrEnum):
     SKIPPED = "skipped"
 
 
+@dataclass(frozen=True, slots=True)
+class GenerationDetails:
+    """Persistable observations from one provider call."""
+
+    latency_ms: float
+    provider_metadata: dict[str, Any]
+
+
 class ComparisonTransition(StrEnum):
     """Pass/fail transition between baseline and candidate."""
 
@@ -64,6 +76,98 @@ class FixtureProviderConfig(BaseModel):
 
     provider: Literal["fixture"]
     path: Path
+
+
+class OllamaProviderConfig(BaseModel):
+    """Configuration for an Ollama-compatible local provider."""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    provider: Literal["ollama"]
+    base_url: str = "http://localhost:11434"
+    model: str
+    prompt_version: str
+    system_prompt_file: Path
+    temperature: Annotated[float, Field(ge=0.0)] = 0.0
+    timeout_seconds: Annotated[float, Field(gt=0.0)] = 120.0
+    seed: Annotated[int | None, Field(ge=0)] = None
+
+    @field_validator("base_url")
+    @classmethod
+    def normalize_base_url(cls, value: str) -> str:
+        """Require an unauthenticated HTTP server root."""
+        candidate = value.strip()
+        try:
+            parsed = urlsplit(candidate)
+            hostname = parsed.hostname
+            port = parsed.port
+        except ValueError as error:
+            raise ValueError("must contain a valid hostname and port") from error
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("must be an HTTP or HTTPS URL")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("must not contain credentials")
+        if parsed.query or parsed.fragment:
+            raise ValueError("must not contain a query string or fragment")
+        if hostname is None or not _is_valid_hostname(hostname):
+            raise ValueError("must contain a valid hostname")
+        if port is None or port == 0:
+            raise ValueError("must contain a valid port between 1 and 65535")
+        if parsed.path not in {"", "/"}:
+            raise ValueError("path must be empty or '/'")
+        return candidate[:-1] if parsed.path == "/" else candidate
+
+    @field_validator("model", "prompt_version")
+    @classmethod
+    def normalize_nonblank_provider_text(cls, value: str) -> str:
+        """Normalize required provider labels."""
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("must not be blank")
+        return normalized
+
+    @field_validator("system_prompt_file", mode="before")
+    @classmethod
+    def reject_blank_prompt_path(cls, value: object) -> object:
+        """Reject values that Path would otherwise coerce to the current directory."""
+        if isinstance(value, (str, Path)) and not str(value).strip():
+            raise ValueError("must not be blank")
+        return value
+
+    @field_validator("temperature", "timeout_seconds", "seed", mode="before")
+    @classmethod
+    def reject_boolean_numbers(cls, value: object) -> object:
+        """Keep YAML booleans from silently becoming numeric options."""
+        if isinstance(value, bool):
+            raise ValueError("must be a number, not a boolean")
+        return value
+
+
+ProviderConfig = Annotated[
+    FixtureProviderConfig | OllamaProviderConfig,
+    Field(discriminator="provider"),
+]
+
+
+def _is_valid_hostname(hostname: str) -> bool:
+    try:
+        ip_address(hostname)
+    except ValueError:
+        if "." in hostname and all(part.isdigit() for part in hostname.split(".")):
+            return False
+        try:
+            ascii_hostname = hostname.encode("idna").decode("ascii").removesuffix(".")
+        except UnicodeError:
+            return False
+        if not ascii_hostname or len(ascii_hostname) > 253:
+            return False
+        return all(
+            1 <= len(label) <= 63
+            and re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?", label)
+            is not None
+            for label in ascii_hostname.split(".")
+        )
+    return True
 
 
 class ModeThresholdOverride(BaseModel):
@@ -100,8 +204,8 @@ class ExperimentConfig(BaseModel):
     schema_version: Literal[1]
     name: str
     dataset: str
-    baseline: FixtureProviderConfig
-    candidate: FixtureProviderConfig
+    baseline: ProviderConfig
+    candidate: ProviderConfig
     gate: RegressionGateConfig = Field(default_factory=RegressionGateConfig)
 
     @field_validator("name", "dataset")

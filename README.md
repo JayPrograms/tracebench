@@ -245,6 +245,56 @@ transactions. A failed stage rolls back its partial rows; a follow-up transactio
 records the operational failure. Machine-readable reports are reconstructed from
 the normalized SQLite result, scorer, aggregate, comparison, and violation rows.
 
+## Local model execution with Ollama
+
+An experiment role may use an Ollama-compatible local server instead of a fixture.
+TraceBench does not install or start Ollama and does not download models. Install
+Ollama, start it, and pull the selected model yourself before running the
+experiment. No API key or authentication configuration is supported.
+
+Store the versioned system prompt in a UTF-8 text file, for example
+`prompts/support-answer-v1.txt`, and reference it from the experiment YAML:
+
+```yaml
+schema_version: 1
+name: local-support-check
+dataset: support-eval:0.1
+baseline:
+  provider: fixture
+  path: support-baseline.jsonl
+candidate:
+  provider: ollama
+  base_url: http://localhost:11434
+  model: llama3.2:3b
+  prompt_version: support-answer-v1
+  system_prompt_file: ../prompts/support-answer-v1.txt
+  temperature: 0
+  timeout_seconds: 120
+  seed: 42
+gate:
+  max_score_drop: 0
+  max_new_failures: 0
+```
+
+Relative prompt paths are resolved from the experiment YAML directory. Prompt
+files may be UTF-8 with or without a byte-order mark and must contain nonblank
+text. TraceBench reads and validates them during preflight, before creating an
+experiment attempt or contacting Ollama. A missing, unreadable, invalidly encoded,
+or blank prompt therefore exits `2` and persists no attempt.
+
+The provider snapshot records `prompt_version` and a SHA-256 hash of the decoded
+prompt contents, not the prompt path or contents. Changing the prompt text changes
+the experiment configuration hash; moving an identical file does not. Generation
+requests append the evaluation input and canonical JSON context using fixed
+TraceBench delimiters and use Ollama's non-streaming `/api/generate` endpoint.
+
+Successful case rows record client-observed generation latency and selected
+Ollama response metadata, including model, termination, duration, and token-count
+fields when returned. These internal persistence additions do not change the
+current human report or `--json` schema. Connection failures, timeouts, HTTP
+errors, and invalid responses are operational failures with exit `3`; TraceBench
+does not retry, start a server, pull a missing model, or select a fallback model.
+
 By default, TraceBench stores data in `.tracebench/tracebench.sqlite3` relative
 to the current directory. Override the location for tests or local workflows
 with `TRACEBENCH_DB_PATH`:

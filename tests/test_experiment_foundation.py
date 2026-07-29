@@ -89,8 +89,10 @@ def test_preflight_accepts_empty_fixture_output(tmp_path: Path) -> None:
         candidate_output="",
     )
 
-    assert prepared.outputs[RunRole.BASELINE][prepared.cases[0].eval_id] == ""
-    assert prepared.outputs[RunRole.CANDIDATE][prepared.cases[0].eval_id] == ""
+    assert prepared.providers[RunRole.BASELINE].generate(prepared.cases[0]).output == ""
+    assert (
+        prepared.providers[RunRole.CANDIDATE].generate(prepared.cases[0]).output == ""
+    )
 
 
 def test_configuration_hash_ignores_name_and_file_location(tmp_path: Path) -> None:

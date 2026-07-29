@@ -4,6 +4,7 @@ import sqlite3
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
+from time import perf_counter_ns
 from typing import Never
 from uuid import uuid4
 
@@ -18,6 +19,7 @@ from tracebench.experiment_models import (
     ExperimentVerdict,
     GateMetric,
     GateViolation,
+    GenerationDetails,
     RunAggregate,
     RunRole,
 )
@@ -29,7 +31,6 @@ from tracebench.experiment_storage import (
     persist_completed_run,
     start_run,
 )
-from tracebench.providers import FixtureProvider
 from tracebench.scorers import score_case
 from tracebench.storage import connect_database
 
@@ -221,14 +222,25 @@ def _execute_and_persist_run(
     try:
         with connection:
             start_run(connection, run_id, datetime.now(UTC))
-        provider = FixtureProvider(prepared.outputs[role])
-        results = [score_case(case, provider.generate(case)) for case in prepared.cases]
+        provider = prepared.providers[role]
+        results: list[CaseResult] = []
+        generation_details: dict[str, GenerationDetails] = {}
+        for case in prepared.cases:
+            started_at = perf_counter_ns()
+            response = provider.generate(case)
+            latency_ms = max(0.0, (perf_counter_ns() - started_at) / 1_000_000)
+            results.append(score_case(case, response.output))
+            generation_details[case.eval_id] = GenerationDetails(
+                latency_ms=latency_ms,
+                provider_metadata=dict(response.metadata),
+            )
         aggregates = aggregate_run(results)
         with connection:
             persist_completed_run(
                 connection,
                 run_id=run_id,
                 results=results,
+                generation_details=generation_details,
                 aggregates=aggregates,
                 timestamp=datetime.now(UTC),
             )
