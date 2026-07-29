@@ -1,0 +1,16 @@
+schema_version: 1
+name: core-evaluation-sample
+dataset: core-eval:0.1
+baseline:
+  provider: fixture
+  path: core-evaluation.baseline.jsonl
+candidate:
+  provider: fixture
+  path: core-evaluation.candidate.jsonl
+gate:
+  max_score_drop: 0
+  max_new_failures: 0
+  by_mode:
+    deterministic:
+      max_score_drop: 0
+      max_new_failures: 0

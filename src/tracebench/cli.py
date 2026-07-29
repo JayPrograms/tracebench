@@ -20,6 +20,9 @@ from tracebench.datasets import (
     get_datasets,
     promote_trace,
 )
+from tracebench.experiment_config import ExperimentPreflightError
+from tracebench.experiment_models import ExperimentReport, ExperimentVerdict
+from tracebench.experiments import ExperimentOperationalError, execute_experiment
 from tracebench.ingestion import IngestionSummary, ingest_file
 from tracebench.models import (
     EvalCase,
@@ -43,8 +46,10 @@ app = typer.Typer(
 )
 traces_app = typer.Typer(help="Inspect stored traces.")
 dataset_app = typer.Typer(help="Manage versioned evaluation datasets.")
+experiment_app = typer.Typer(help="Run persisted baseline/candidate experiments.")
 app.add_typer(traces_app, name="traces")
 app.add_typer(dataset_app, name="dataset")
+app.add_typer(experiment_app, name="experiment")
 
 
 @app.callback()
@@ -270,12 +275,113 @@ def export_eval_dataset(
     typer.echo(f"Exported {count} evaluation cases to {output}.")
 
 
+@experiment_app.command("run")
+def run_experiment_command(
+    config: Annotated[
+        Path,
+        typer.Argument(
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            help="Path to a versioned experiment YAML file.",
+        ),
+    ],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print only the machine-readable JSON result."),
+    ] = False,
+) -> None:
+    """Run, score, compare, gate, and persist an experiment attempt."""
+    try:
+        report = execute_experiment(config, resolve_database_path())
+    except ExperimentPreflightError as error:
+        typer.echo(f"Error: {error}; no experiment attempt was persisted", err=True)
+        raise typer.Exit(code=2) from error
+    except ExperimentOperationalError as error:
+        _print_operational_failure(error, json_output=json_output)
+        raise typer.Exit(code=3) from error
+    except (OSError, sqlite3.Error, ValueError) as error:
+        typer.echo(f"Operational failure before attempt creation: {error}", err=True)
+        raise typer.Exit(code=3) from error
+
+    if json_output:
+        typer.echo(
+            json.dumps(
+                report.model_dump(mode="json", by_alias=True),
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+    else:
+        _print_experiment_report(report)
+    if report.verdict is ExperimentVerdict.FAIL:
+        raise typer.Exit(code=1)
+
+
 def _print_ingestion_summary(summary: IngestionSummary) -> None:
     typer.echo(f"Records read: {summary.records_read}")
     typer.echo(f"Records accepted: {summary.records_accepted}")
     typer.echo(f"Invalid records: {summary.invalid_records}")
     typer.echo(f"Duplicates skipped: {summary.duplicates_skipped}")
     typer.echo(f"Records stored: {summary.records_stored}")
+
+
+def _print_experiment_report(report: ExperimentReport) -> None:
+    """Print the concise human representation of a completed experiment."""
+    if report.verdict is None or report.comparison is None or report.gate is None:
+        raise ValueError("completed experiment report is missing a verdict")
+    baseline = report.runs[
+        next(role for role in report.runs if role.value == "baseline")
+    ]
+    candidate = report.runs[
+        next(role for role in report.runs if role.value == "candidate")
+    ]
+    typer.echo(report.verdict.value)
+    typer.echo(f"Experiment: {report.experiment_id}")
+    typer.echo(f"Configuration hash: {report.configuration_hash}")
+    typer.echo(
+        f"Dataset: {report.dataset.name}:{report.dataset.version} "
+        f"({report.comparison.global_.case_count} cases)"
+    )
+    typer.echo(f"Baseline score: {baseline.global_.score:.6f}")
+    typer.echo(f"Candidate score: {candidate.global_.score:.6f}")
+    typer.echo(f"Newly passed: {len(report.comparison.newly_passed)}")
+    typer.echo(f"Newly failed: {len(report.comparison.newly_failed)}")
+    for violation in report.gate.violations:
+        typer.echo(f"Violation: {violation.message}")
+
+
+def _print_operational_failure(
+    error: ExperimentOperationalError,
+    *,
+    json_output: bool,
+) -> None:
+    """Render an operational failure separately from a regression verdict."""
+    if json_output:
+        typer.echo(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "experiment_id": error.experiment_id,
+                    "status": "failed",
+                    "verdict": None,
+                    "failure_stage": error.stage,
+                    "failure_message": error.message,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+    else:
+        typer.echo(
+            f"Operational failure: experiment {error.experiment_id} failed during "
+            f"{error.stage}: {error.message}",
+            err=True,
+        )
 
 
 def _print_trace_table(traces: list[Trace]) -> None:

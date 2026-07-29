@@ -18,9 +18,9 @@ TraceBench is local-first and designed to work without paid services.
 
 ## Development status
 
-TraceBench currently supports importing application traces into a local SQLite
-database, listing stored traces, and promoting selected traces into explicitly
-versioned evaluation datasets.
+TraceBench supports importing application traces, promoting selected traces into
+versioned evaluation datasets, and running persisted baseline-versus-candidate
+experiments with deterministic regression gates.
 
 ## Trace ingestion
 
@@ -77,8 +77,8 @@ tracebench dataset add-trace `
   --use-source-response
 ```
 
-Deterministic mode requires one or more scorer configurations. TraceBench stores
-these configurations but does not execute them:
+Deterministic mode requires one or more scorer configurations. The core experiment
+loop validates and executes the built-in configurations:
 
 ```powershell
 tracebench dataset add-trace `
@@ -141,6 +141,109 @@ evaluation-dataset implementation must be recreated because they contain
 random IDs and lack the provenance columns and final integrity constraints.
 TraceBench reports this incompatibility when opening such a database; reingest
 the original trace JSONL and recreate its datasets in a new database.
+
+## Core evaluation loop
+
+The checked-in sample demonstrates the complete workflow. Start with a fresh local
+database, ingest the traces, and create the versioned dataset used by the sample
+experiment:
+
+```powershell
+$env:TRACEBENCH_DB_PATH = ".tracebench/core-loop.sqlite3"
+tracebench ingest datasets/traces.sample.jsonl
+tracebench dataset create `
+  --name core-eval `
+  --version 0.1 `
+  --description "Core evaluation-loop sample"
+```
+
+Promote the three traces with all five deterministic scorer types:
+
+```powershell
+tracebench dataset add-trace `
+  --dataset core-eval:0.1 `
+  --trace-id sample-001 `
+  --mode deterministic `
+  --scorer-file datasets/scorer.exact-match.json `
+  --scorer-file datasets/scorer.contains.json
+
+tracebench dataset add-trace `
+  --dataset core-eval:0.1 `
+  --trace-id sample-002 `
+  --mode deterministic `
+  --scorer-file datasets/scorer.regex.json
+
+tracebench dataset add-trace `
+  --dataset core-eval:0.1 `
+  --trace-id sample-003 `
+  --mode deterministic `
+  --scorer-file datasets/scorer.json-validity.json `
+  --scorer-file datasets/scorer.required-keys.json
+```
+
+Run the baseline and candidate fixtures, score both, compare them globally and by
+evaluation mode, and apply the configured regression gate:
+
+```powershell
+tracebench experiment run datasets/core-evaluation.sample.yaml
+```
+
+The sample baseline fails the `required_keys` scorer for one case, while the
+candidate fixes it without introducing a failure, so the command prints `PASS` and
+exits `0`. Use `--json` for a stable machine-readable result:
+
+```powershell
+tracebench experiment run datasets/core-evaluation.sample.yaml --json
+$LASTEXITCODE
+```
+
+Each fixture is UTF-8 JSONL with exactly one strict record per evaluation case:
+
+```json
+{"eval_id":"eval_...","output":"provider output, which may be empty"}
+```
+
+Duplicate, missing, or unknown evaluation IDs are rejected before an experiment
+attempt is created. Fixture paths in YAML are relative to the configuration file.
+The supported scorer configurations are:
+
+- `exact_match`: `expected` and optional `case_sensitive` (default `true`)
+- `contains`: nonblank `substring` and optional `case_sensitive`
+- `regex`: compilable `pattern` and optional `case_sensitive`; matching uses search
+  semantics
+- `json_validity`: an empty configuration and strict standard-JSON parsing
+- `required_keys`: a nonempty, unique list of required top-level JSON object `keys`
+
+Reference-mode cases use implicit case-sensitive exact matching against their
+reference answer. Rubric cases are rejected because the core loop is fully local
+and deterministic.
+
+The YAML gate defaults to zero allowed global score drop and zero newly failed
+cases. Optional `by_mode` entries may override either limit and inherit the other
+global value. An override must name a supported mode present in the dataset.
+Absent modes are omitted from results rather than represented with zero or `NaN`.
+
+Every successful preflight creates a new experiment attempt. Names are reusable
+labels, so rerunning the same name never overwrites or resumes an earlier attempt.
+Every attempt receives a new ID; behaviorally identical dataset definitions,
+fixtures, scorers, and thresholds receive the same deterministic configuration
+hash.
+
+Experiment status and verdict are separate. A completed gate decision has status
+`completed` and verdict `PASS` or `FAIL`. An operationally failed attempt has status
+`failed` and a null verdict. Exit codes are:
+
+| Exit | Meaning |
+| ---: | --- |
+| `0` | Completed and passed the regression gate |
+| `1` | Completed and failed the regression gate |
+| `2` | Usage or preflight validation error; no attempt was persisted |
+| `3` | Operational failure; an accepted attempt is marked failed when possible |
+
+Baseline results, candidate results, and comparison/gate results use separate
+transactions. A failed stage rolls back its partial rows; a follow-up transaction
+records the operational failure. Machine-readable reports are reconstructed from
+the normalized SQLite result, scorer, aggregate, comparison, and violation rows.
 
 By default, TraceBench stores data in `.tracebench/tracebench.sqlite3` relative
 to the current directory. Override the location for tests or local workflows

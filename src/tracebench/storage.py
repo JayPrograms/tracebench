@@ -119,6 +119,216 @@ CREATE TABLE IF NOT EXISTS eval_cases (
 CREATE INDEX IF NOT EXISTS idx_eval_cases_dataset_eval
 ON eval_cases (dataset_id, eval_id ASC)
     """,
+    """
+CREATE TABLE IF NOT EXISTS experiments (
+    experiment_id TEXT PRIMARY KEY CHECK (length(trim(experiment_id)) > 0),
+    name TEXT NOT NULL CHECK (length(trim(name)) > 0),
+    dataset_id TEXT NOT NULL
+        REFERENCES eval_datasets(dataset_id) ON DELETE RESTRICT,
+    configuration_hash TEXT NOT NULL
+        CHECK (
+            length(configuration_hash) = 64
+            AND configuration_hash NOT GLOB '*[^0-9a-f]*'
+        ),
+    configuration_json TEXT NOT NULL
+        CHECK (
+            json_valid(configuration_json)
+            AND json_type(configuration_json) = 'object'
+        ),
+    status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
+    verdict TEXT CHECK (verdict IN ('PASS', 'FAIL')),
+    failure_stage TEXT,
+    failure_message TEXT,
+    created_at TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    CHECK (
+        (
+            status = 'running'
+            AND verdict IS NULL
+            AND failure_stage IS NULL
+            AND failure_message IS NULL
+            AND completed_at IS NULL
+        )
+        OR (
+            status = 'completed'
+            AND verdict IN ('PASS', 'FAIL')
+            AND failure_stage IS NULL
+            AND failure_message IS NULL
+            AND completed_at IS NOT NULL
+        )
+        OR (
+            status = 'failed'
+            AND verdict IS NULL
+            AND length(trim(failure_stage)) > 0
+            AND length(trim(failure_message)) > 0
+            AND completed_at IS NOT NULL
+        )
+    )
+)
+""",
+    """
+CREATE INDEX IF NOT EXISTS idx_experiments_name_created
+ON experiments (name ASC, created_at DESC, experiment_id ASC)
+""",
+    """
+CREATE INDEX IF NOT EXISTS idx_experiments_configuration_hash
+ON experiments (configuration_hash, created_at ASC)
+""",
+    """
+CREATE TABLE IF NOT EXISTS experiment_runs (
+    run_id TEXT PRIMARY KEY CHECK (length(trim(run_id)) > 0),
+    experiment_id TEXT NOT NULL
+        REFERENCES experiments(experiment_id) ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK (role IN ('baseline', 'candidate')),
+    provider_name TEXT NOT NULL CHECK (provider_name = 'fixture'),
+    provider_config_json TEXT NOT NULL
+        CHECK (
+            json_valid(provider_config_json)
+            AND json_type(provider_config_json) = 'object'
+        ),
+    status TEXT NOT NULL
+        CHECK (status IN ('pending', 'running', 'completed', 'failed', 'skipped')),
+    error_message TEXT,
+    started_at TEXT,
+    completed_at TEXT,
+    UNIQUE (experiment_id, role),
+    CHECK (
+        (
+            status = 'pending'
+            AND error_message IS NULL
+            AND started_at IS NULL
+            AND completed_at IS NULL
+        )
+        OR (
+            status = 'running'
+            AND error_message IS NULL
+            AND started_at IS NOT NULL
+            AND completed_at IS NULL
+        )
+        OR (
+            status = 'completed'
+            AND error_message IS NULL
+            AND started_at IS NOT NULL
+            AND completed_at IS NOT NULL
+        )
+        OR (
+            status = 'failed'
+            AND length(trim(error_message)) > 0
+            AND started_at IS NOT NULL
+            AND completed_at IS NOT NULL
+        )
+        OR (
+            status = 'skipped'
+            AND length(trim(error_message)) > 0
+            AND started_at IS NULL
+            AND completed_at IS NOT NULL
+        )
+    )
+)
+""",
+    """
+CREATE TABLE IF NOT EXISTS experiment_case_results (
+    run_id TEXT NOT NULL
+        REFERENCES experiment_runs(run_id) ON DELETE CASCADE,
+    eval_id TEXT NOT NULL
+        REFERENCES eval_cases(eval_id) ON DELETE RESTRICT,
+    evaluation_mode TEXT NOT NULL
+        CHECK (evaluation_mode IN ('deterministic', 'reference')),
+    output TEXT NOT NULL,
+    score REAL NOT NULL CHECK (score >= 0.0 AND score <= 1.0),
+    passed INTEGER NOT NULL CHECK (passed IN (0, 1)),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, eval_id)
+)
+""",
+    """
+CREATE TABLE IF NOT EXISTS experiment_scorer_results (
+    run_id TEXT NOT NULL,
+    eval_id TEXT NOT NULL,
+    scorer_index INTEGER NOT NULL CHECK (scorer_index >= 0),
+    scorer_name TEXT NOT NULL CHECK (length(trim(scorer_name)) > 0),
+    score REAL NOT NULL CHECK (score >= 0.0 AND score <= 1.0),
+    passed INTEGER NOT NULL CHECK (passed IN (0, 1)),
+    details_json TEXT NOT NULL
+        CHECK (json_valid(details_json) AND json_type(details_json) = 'object'),
+    PRIMARY KEY (run_id, eval_id, scorer_index),
+    FOREIGN KEY (run_id, eval_id)
+        REFERENCES experiment_case_results(run_id, eval_id) ON DELETE CASCADE
+)
+""",
+    """
+CREATE TABLE IF NOT EXISTS experiment_run_aggregates (
+    run_id TEXT NOT NULL
+        REFERENCES experiment_runs(run_id) ON DELETE CASCADE,
+    scope TEXT NOT NULL
+        CHECK (scope IN ('global', 'deterministic', 'reference')),
+    case_count INTEGER NOT NULL CHECK (case_count > 0),
+    passed_count INTEGER NOT NULL CHECK (passed_count >= 0),
+    failed_count INTEGER NOT NULL CHECK (failed_count >= 0),
+    score REAL NOT NULL CHECK (score >= 0.0 AND score <= 1.0),
+    pass_rate REAL NOT NULL CHECK (pass_rate >= 0.0 AND pass_rate <= 1.0),
+    PRIMARY KEY (run_id, scope),
+    CHECK (passed_count + failed_count = case_count)
+)
+""",
+    """
+CREATE TABLE IF NOT EXISTS experiment_case_comparisons (
+    experiment_id TEXT NOT NULL
+        REFERENCES experiments(experiment_id) ON DELETE CASCADE,
+    eval_id TEXT NOT NULL
+        REFERENCES eval_cases(eval_id) ON DELETE RESTRICT,
+    evaluation_mode TEXT NOT NULL
+        CHECK (evaluation_mode IN ('deterministic', 'reference')),
+    baseline_score REAL NOT NULL
+        CHECK (baseline_score >= 0.0 AND baseline_score <= 1.0),
+    candidate_score REAL NOT NULL
+        CHECK (candidate_score >= 0.0 AND candidate_score <= 1.0),
+    score_delta REAL NOT NULL CHECK (score_delta >= -1.0 AND score_delta <= 1.0),
+    baseline_passed INTEGER NOT NULL CHECK (baseline_passed IN (0, 1)),
+    candidate_passed INTEGER NOT NULL CHECK (candidate_passed IN (0, 1)),
+    transition TEXT NOT NULL
+        CHECK (
+            transition IN (
+                'passed_both', 'failed_both', 'newly_passed', 'newly_failed'
+            )
+        ),
+    PRIMARY KEY (experiment_id, eval_id)
+)
+""",
+    """
+CREATE TABLE IF NOT EXISTS experiment_comparison_aggregates (
+    experiment_id TEXT NOT NULL
+        REFERENCES experiments(experiment_id) ON DELETE CASCADE,
+    scope TEXT NOT NULL
+        CHECK (scope IN ('global', 'deterministic', 'reference')),
+    case_count INTEGER NOT NULL CHECK (case_count > 0),
+    baseline_score REAL NOT NULL
+        CHECK (baseline_score >= 0.0 AND baseline_score <= 1.0),
+    candidate_score REAL NOT NULL
+        CHECK (candidate_score >= 0.0 AND candidate_score <= 1.0),
+    score_delta REAL NOT NULL CHECK (score_delta >= -1.0 AND score_delta <= 1.0),
+    newly_passed_count INTEGER NOT NULL CHECK (newly_passed_count >= 0),
+    newly_failed_count INTEGER NOT NULL CHECK (newly_failed_count >= 0),
+    PRIMARY KEY (experiment_id, scope),
+    CHECK (newly_passed_count <= case_count),
+    CHECK (newly_failed_count <= case_count)
+)
+""",
+    """
+CREATE TABLE IF NOT EXISTS experiment_gate_violations (
+    experiment_id TEXT NOT NULL
+        REFERENCES experiments(experiment_id) ON DELETE CASCADE,
+    violation_index INTEGER NOT NULL CHECK (violation_index >= 0),
+    scope TEXT NOT NULL
+        CHECK (scope IN ('global', 'deterministic', 'reference')),
+    metric TEXT NOT NULL CHECK (metric IN ('score_drop', 'new_failures')),
+    actual REAL NOT NULL CHECK (actual >= 0.0),
+    allowed REAL NOT NULL CHECK (allowed >= 0.0),
+    message TEXT NOT NULL CHECK (length(trim(message)) > 0),
+    PRIMARY KEY (experiment_id, violation_index)
+)
+""",
 )
 
 _EVAL_CASE_JSON_VALIDATION = f"""
@@ -173,6 +383,69 @@ BEFORE UPDATE ON eval_cases
 BEGIN
 {_EVAL_CASE_JSON_VALIDATION}
 END
+    """,
+)
+
+_EXPERIMENT_RESULT_RELATION_VALIDATION = """
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1
+        FROM experiment_runs AS run
+        JOIN experiments AS experiment
+            ON experiment.experiment_id = run.experiment_id
+        JOIN eval_cases AS eval_case
+            ON eval_case.eval_id = NEW.eval_id
+        WHERE run.run_id = NEW.run_id
+            AND eval_case.dataset_id = experiment.dataset_id
+            AND eval_case.evaluation_mode = NEW.evaluation_mode
+    ) THEN RAISE(
+        ABORT,
+        'experiment result case must belong to the attempt dataset and mode'
+    ) END;
+"""
+
+_EXPERIMENT_COMPARISON_RELATION_VALIDATION = """
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1
+        FROM experiments AS experiment
+        JOIN eval_cases AS eval_case
+            ON eval_case.eval_id = NEW.eval_id
+        WHERE experiment.experiment_id = NEW.experiment_id
+            AND eval_case.dataset_id = experiment.dataset_id
+            AND eval_case.evaluation_mode = NEW.evaluation_mode
+    ) THEN RAISE(
+        ABORT,
+        'experiment comparison case must belong to the attempt dataset and mode'
+    ) END;
+"""
+
+EXPERIMENT_TRIGGER_STATEMENTS = (
+    f"""
+CREATE TRIGGER IF NOT EXISTS validate_experiment_result_relation_insert
+BEFORE INSERT ON experiment_case_results
+BEGIN
+{_EXPERIMENT_RESULT_RELATION_VALIDATION}
+END
+""",
+    f"""
+CREATE TRIGGER IF NOT EXISTS validate_experiment_result_relation_update
+BEFORE UPDATE ON experiment_case_results
+BEGIN
+{_EXPERIMENT_RESULT_RELATION_VALIDATION}
+END
+""",
+    f"""
+CREATE TRIGGER IF NOT EXISTS validate_experiment_comparison_relation_insert
+BEFORE INSERT ON experiment_case_comparisons
+BEGIN
+{_EXPERIMENT_COMPARISON_RELATION_VALIDATION}
+END
+""",
+    f"""
+CREATE TRIGGER IF NOT EXISTS validate_experiment_comparison_relation_update
+BEFORE UPDATE ON experiment_case_comparisons
+BEGIN
+{_EXPERIMENT_COMPARISON_RELATION_VALIDATION}
+END
 """,
 )
 
@@ -208,7 +481,10 @@ def connect_database(database_path: Path) -> sqlite3.Connection:
         for statement in SCHEMA_STATEMENTS:
             connection.execute(statement)
         _ensure_eval_schema_compatible(connection)
-        for statement in EVAL_CASE_TRIGGER_STATEMENTS:
+        for statement in (
+            *EVAL_CASE_TRIGGER_STATEMENTS,
+            *EXPERIMENT_TRIGGER_STATEMENTS,
+        ):
             connection.execute(statement)
         connection.commit()
     except BaseException:
