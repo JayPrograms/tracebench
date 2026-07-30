@@ -229,13 +229,40 @@ CREATE TABLE IF NOT EXISTS experiment_runs (
 )
 """,
     """
+CREATE TABLE IF NOT EXISTS experiment_judges (
+    experiment_id TEXT PRIMARY KEY
+        REFERENCES experiments(experiment_id) ON DELETE CASCADE,
+    provider_name TEXT NOT NULL
+        CHECK (provider_name IN ('fixture', 'ollama')),
+    provider_config_json TEXT NOT NULL
+        CHECK (
+            json_valid(provider_config_json)
+            AND json_type(provider_config_json) = 'object'
+        ),
+    prompt_version TEXT NOT NULL CHECK (length(trim(prompt_version)) > 0),
+    prompt_hash TEXT NOT NULL
+        CHECK (length(prompt_hash) = 64 AND prompt_hash NOT GLOB '*[^0-9a-f]*'),
+    retry_prompt_hash TEXT NOT NULL
+        CHECK (
+            length(retry_prompt_hash) = 64
+            AND retry_prompt_hash NOT GLOB '*[^0-9a-f]*'
+        ),
+    response_schema_version INTEGER NOT NULL
+        CHECK (response_schema_version = 1),
+    max_malformed_retries INTEGER NOT NULL
+        CHECK (max_malformed_retries = 1),
+    confidence_threshold REAL NOT NULL
+        CHECK (confidence_threshold >= 0.0 AND confidence_threshold <= 1.0)
+)
+""",
+    """
 CREATE TABLE IF NOT EXISTS experiment_case_results (
     run_id TEXT NOT NULL
         REFERENCES experiment_runs(run_id) ON DELETE CASCADE,
     eval_id TEXT NOT NULL
         REFERENCES eval_cases(eval_id) ON DELETE RESTRICT,
     evaluation_mode TEXT NOT NULL
-        CHECK (evaluation_mode IN ('deterministic', 'reference')),
+        CHECK (evaluation_mode IN ('deterministic', 'reference', 'rubric')),
     output TEXT NOT NULL,
     score REAL NOT NULL CHECK (score >= 0.0 AND score <= 1.0),
     passed INTEGER NOT NULL CHECK (passed IN (0, 1)),
@@ -247,6 +274,35 @@ CREATE TABLE IF NOT EXISTS experiment_case_results (
         ),
     created_at TEXT NOT NULL,
     PRIMARY KEY (run_id, eval_id)
+)
+""",
+    """
+CREATE TABLE IF NOT EXISTS experiment_judge_attempts (
+    run_id TEXT NOT NULL
+        REFERENCES experiment_runs(run_id) ON DELETE CASCADE,
+    eval_id TEXT NOT NULL
+        REFERENCES eval_cases(eval_id) ON DELETE RESTRICT,
+    attempt_number INTEGER NOT NULL CHECK (attempt_number IN (1, 2)),
+    request_hash TEXT NOT NULL
+        CHECK (length(request_hash) = 64 AND request_hash NOT GLOB '*[^0-9a-f]*'),
+    raw_output TEXT NOT NULL,
+    parse_status TEXT NOT NULL CHECK (parse_status IN ('parsed', 'malformed')),
+    validation_error TEXT,
+    latency_ms REAL NOT NULL CHECK (latency_ms >= 0.0),
+    provider_metadata_json TEXT NOT NULL
+        CHECK (
+            json_valid(provider_metadata_json)
+            AND json_type(provider_metadata_json) = 'object'
+        ),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, eval_id, attempt_number),
+    CHECK (
+        (parse_status = 'parsed' AND validation_error IS NULL)
+        OR (
+            parse_status = 'malformed'
+            AND length(trim(validation_error)) > 0
+        )
+    )
 )
 """,
     """
@@ -265,11 +321,36 @@ CREATE TABLE IF NOT EXISTS experiment_scorer_results (
 )
 """,
     """
+CREATE TABLE IF NOT EXISTS experiment_judge_results (
+    run_id TEXT NOT NULL,
+    eval_id TEXT NOT NULL,
+    final_attempt_number INTEGER NOT NULL CHECK (final_attempt_number IN (1, 2)),
+    response_schema_version INTEGER NOT NULL CHECK (response_schema_version = 1),
+    overall_score REAL NOT NULL CHECK (overall_score >= 0.0 AND overall_score <= 1.0),
+    overall_passed INTEGER NOT NULL CHECK (overall_passed IN (0, 1)),
+    confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+    confidence_threshold REAL NOT NULL
+        CHECK (confidence_threshold >= 0.0 AND confidence_threshold <= 1.0),
+    below_confidence_threshold INTEGER NOT NULL
+        CHECK (below_confidence_threshold IN (0, 1)),
+    PRIMARY KEY (run_id, eval_id),
+    FOREIGN KEY (run_id, eval_id)
+        REFERENCES experiment_case_results(run_id, eval_id) ON DELETE CASCADE,
+    FOREIGN KEY (run_id, eval_id, final_attempt_number)
+        REFERENCES experiment_judge_attempts(
+            run_id, eval_id, attempt_number
+        ) ON DELETE RESTRICT,
+    CHECK (
+        below_confidence_threshold = (confidence < confidence_threshold)
+    )
+)
+""",
+    """
 CREATE TABLE IF NOT EXISTS experiment_run_aggregates (
     run_id TEXT NOT NULL
         REFERENCES experiment_runs(run_id) ON DELETE CASCADE,
     scope TEXT NOT NULL
-        CHECK (scope IN ('global', 'deterministic', 'reference')),
+        CHECK (scope IN ('global', 'deterministic', 'reference', 'rubric')),
     case_count INTEGER NOT NULL CHECK (case_count > 0),
     passed_count INTEGER NOT NULL CHECK (passed_count >= 0),
     failed_count INTEGER NOT NULL CHECK (failed_count >= 0),
@@ -286,7 +367,7 @@ CREATE TABLE IF NOT EXISTS experiment_case_comparisons (
     eval_id TEXT NOT NULL
         REFERENCES eval_cases(eval_id) ON DELETE RESTRICT,
     evaluation_mode TEXT NOT NULL
-        CHECK (evaluation_mode IN ('deterministic', 'reference')),
+        CHECK (evaluation_mode IN ('deterministic', 'reference', 'rubric')),
     baseline_score REAL NOT NULL
         CHECK (baseline_score >= 0.0 AND baseline_score <= 1.0),
     candidate_score REAL NOT NULL
@@ -308,7 +389,7 @@ CREATE TABLE IF NOT EXISTS experiment_comparison_aggregates (
     experiment_id TEXT NOT NULL
         REFERENCES experiments(experiment_id) ON DELETE CASCADE,
     scope TEXT NOT NULL
-        CHECK (scope IN ('global', 'deterministic', 'reference')),
+        CHECK (scope IN ('global', 'deterministic', 'reference', 'rubric')),
     case_count INTEGER NOT NULL CHECK (case_count > 0),
     baseline_score REAL NOT NULL
         CHECK (baseline_score >= 0.0 AND baseline_score <= 1.0),
@@ -328,7 +409,7 @@ CREATE TABLE IF NOT EXISTS experiment_gate_violations (
         REFERENCES experiments(experiment_id) ON DELETE CASCADE,
     violation_index INTEGER NOT NULL CHECK (violation_index >= 0),
     scope TEXT NOT NULL
-        CHECK (scope IN ('global', 'deterministic', 'reference')),
+        CHECK (scope IN ('global', 'deterministic', 'reference', 'rubric')),
     metric TEXT NOT NULL CHECK (metric IN ('score_drop', 'new_failures')),
     actual REAL NOT NULL CHECK (actual >= 0.0),
     allowed REAL NOT NULL CHECK (allowed >= 0.0),
@@ -425,6 +506,39 @@ _EXPERIMENT_COMPARISON_RELATION_VALIDATION = """
     ) END;
 """
 
+_JUDGE_ATTEMPT_RELATION_VALIDATION = """
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1
+        FROM experiment_runs AS run
+        JOIN experiments AS experiment
+            ON experiment.experiment_id = run.experiment_id
+        JOIN experiment_judges AS judge
+            ON judge.experiment_id = experiment.experiment_id
+        JOIN eval_cases AS eval_case
+            ON eval_case.eval_id = NEW.eval_id
+        WHERE run.run_id = NEW.run_id
+            AND eval_case.dataset_id = experiment.dataset_id
+            AND eval_case.evaluation_mode = 'rubric'
+    ) THEN RAISE(
+        ABORT,
+        'judge attempt case must be a rubric case in the attempt dataset'
+    ) END;
+"""
+
+_JUDGE_RESULT_RELATION_VALIDATION = """
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1
+        FROM experiment_judge_attempts AS attempt
+        WHERE attempt.run_id = NEW.run_id
+            AND attempt.eval_id = NEW.eval_id
+            AND attempt.attempt_number = NEW.final_attempt_number
+            AND attempt.parse_status = 'parsed'
+    ) THEN RAISE(
+        ABORT,
+        'judge result must reference a parsed final attempt'
+    ) END;
+"""
+
 EXPERIMENT_TRIGGER_STATEMENTS = (
     f"""
 CREATE TRIGGER IF NOT EXISTS validate_experiment_result_relation_insert
@@ -452,6 +566,34 @@ CREATE TRIGGER IF NOT EXISTS validate_experiment_comparison_relation_update
 BEFORE UPDATE ON experiment_case_comparisons
 BEGIN
 {_EXPERIMENT_COMPARISON_RELATION_VALIDATION}
+END
+""",
+    f"""
+CREATE TRIGGER IF NOT EXISTS validate_judge_attempt_relation_insert
+BEFORE INSERT ON experiment_judge_attempts
+BEGIN
+{_JUDGE_ATTEMPT_RELATION_VALIDATION}
+END
+""",
+    f"""
+CREATE TRIGGER IF NOT EXISTS validate_judge_attempt_relation_update
+BEFORE UPDATE ON experiment_judge_attempts
+BEGIN
+{_JUDGE_ATTEMPT_RELATION_VALIDATION}
+END
+""",
+    f"""
+CREATE TRIGGER IF NOT EXISTS validate_judge_result_relation_insert
+BEFORE INSERT ON experiment_judge_results
+BEGIN
+{_JUDGE_RESULT_RELATION_VALIDATION}
+END
+""",
+    f"""
+CREATE TRIGGER IF NOT EXISTS validate_judge_result_relation_update
+BEFORE UPDATE ON experiment_judge_results
+BEGIN
+{_JUDGE_RESULT_RELATION_VALIDATION}
 END
 """,
 )
@@ -887,6 +1029,74 @@ def _migrate_experiment_schema(connection: sqlite3.Connection) -> None:
             """
         )
 
+    rubric_constrained_tables = (
+        "experiment_case_results",
+        "experiment_run_aggregates",
+        "experiment_case_comparisons",
+        "experiment_comparison_aggregates",
+        "experiment_gate_violations",
+    )
+    tables_to_rebuild: list[str] = []
+    for table_name in rubric_constrained_tables:
+        schema_row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
+        ).fetchone()
+        if schema_row is None:
+            raise sqlite3.DatabaseError(f"{table_name} schema is missing")
+        if "'rubric'" not in str(schema_row["sql"]):
+            tables_to_rebuild.append(table_name)
+    if tables_to_rebuild:
+        _rebuild_experiment_tables(connection, tables_to_rebuild)
+
+
+def _rebuild_experiment_tables(
+    connection: sqlite3.Connection,
+    table_names: list[str],
+) -> None:
+    """Replace constrained experiment tables while preserving their rows."""
+    trigger_names = (
+        "validate_experiment_result_relation_insert",
+        "validate_experiment_result_relation_update",
+        "validate_experiment_comparison_relation_insert",
+        "validate_experiment_comparison_relation_update",
+        "validate_judge_attempt_relation_insert",
+        "validate_judge_attempt_relation_update",
+        "validate_judge_result_relation_insert",
+        "validate_judge_result_relation_update",
+    )
+    for trigger_name in trigger_names:
+        connection.execute(f'DROP TRIGGER IF EXISTS "{trigger_name}"')
+    for table_name in table_names:
+        marker = f"CREATE TABLE IF NOT EXISTS {table_name} ("
+        current_statement = next(
+            (statement for statement in SCHEMA_STATEMENTS if marker in statement),
+            None,
+        )
+        if current_statement is None:
+            raise sqlite3.DatabaseError(f"current {table_name} schema is missing")
+        migration_name = f"{table_name}_migration"
+        migration_statement = current_statement.replace(
+            marker,
+            f"CREATE TABLE {migration_name} (",
+            1,
+        )
+        columns = [
+            str(row["name"])
+            for row in connection.execute(
+                f'PRAGMA table_info("{table_name}")'
+            ).fetchall()
+        ]
+        encoded_columns = ", ".join(f'"{column}"' for column in columns)
+        connection.execute(f'DROP TABLE IF EXISTS "{migration_name}"')
+        connection.execute(migration_statement)
+        connection.execute(
+            f'INSERT INTO "{migration_name}" ({encoded_columns}) '
+            f'SELECT {encoded_columns} FROM "{table_name}"'
+        )
+        connection.execute(f'DROP TABLE "{table_name}"')
+        connection.execute(f'ALTER TABLE "{migration_name}" RENAME TO "{table_name}"')
+
 
 def _rebuild_experiment_runs(connection: sqlite3.Connection) -> None:
     """Replace the fixture-only provider constraint while preserving runs."""
@@ -898,6 +1108,8 @@ def _rebuild_experiment_runs(connection: sqlite3.Connection) -> None:
     connection.execute(
         "DROP TRIGGER IF EXISTS validate_experiment_result_relation_update"
     )
+    connection.execute("DROP TRIGGER IF EXISTS validate_judge_attempt_relation_insert")
+    connection.execute("DROP TRIGGER IF EXISTS validate_judge_attempt_relation_update")
     run_statement = next(
         (
             statement

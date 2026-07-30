@@ -29,8 +29,19 @@ from tracebench.experiment_storage import (
     load_experiment_report,
     persist_completed_comparison,
     persist_completed_run,
+    persist_judge_attempt,
     start_run,
 )
+from tracebench.judges import (
+    JudgeOutputError,
+    build_judge_prompt,
+    build_judge_retry_prompt,
+    judge_request_id,
+    parse_judge_output,
+    request_hash,
+)
+from tracebench.models import EvalCase, EvaluationMode
+from tracebench.providers import ProviderError, ProviderRequest, build_prompt
 from tracebench.scorers import score_case
 from tracebench.storage import connect_database
 
@@ -66,6 +77,9 @@ def execute_experiment(config_path: Path, database_path: Path) -> ExperimentRepo
                     run_ids=run_ids,
                     provider_snapshots=prepared.provider_snapshots,
                     timestamp=datetime.now(UTC),
+                    judge_snapshot=(
+                        prepared.judge.snapshot if prepared.judge is not None else None
+                    ),
                 )
         except Exception as error:
             raise ExperimentOperationalError(
@@ -227,9 +241,25 @@ def _execute_and_persist_run(
         generation_details: dict[str, GenerationDetails] = {}
         for case in prepared.cases:
             started_at = perf_counter_ns()
-            response = provider.generate(case)
+            system_prompt = prepared.provider_prompts[role]
+            prompt = "" if system_prompt is None else build_prompt(case, system_prompt)
+            response = provider.generate(
+                ProviderRequest(request_id=case.eval_id, prompt=prompt)
+            )
             latency_ms = max(0.0, (perf_counter_ns() - started_at) / 1_000_000)
-            results.append(score_case(case, response.output))
+            if case.evaluation_mode is EvaluationMode.RUBRIC:
+                results.append(
+                    _judge_case(
+                        connection=connection,
+                        prepared=prepared,
+                        run_id=run_id,
+                        role=role,
+                        case=case,
+                        output=response.output,
+                    )
+                )
+            else:
+                results.append(score_case(case, response.output))
             generation_details[case.eval_id] = GenerationDetails(
                 latency_ms=latency_ms,
                 provider_metadata=dict(response.metadata),
@@ -253,6 +283,99 @@ def _execute_and_persist_run(
             stage=stage,
             error=error,
         )
+
+
+def _judge_case(
+    *,
+    connection: sqlite3.Connection,
+    prepared: PreparedExperiment,
+    run_id: str,
+    role: RunRole,
+    case: EvalCase,
+    output: str,
+) -> CaseResult:
+    judge = prepared.judge
+    if judge is None:
+        raise ValueError("rubric case has no prepared judge")
+    previous_output: str | None = None
+    previous_error: JudgeOutputError | None = None
+    for attempt_number in (1, 2):
+        if attempt_number == 1:
+            prompt = build_judge_prompt(case, output, judge.prompt)
+        else:
+            if previous_output is None or previous_error is None:
+                raise AssertionError(
+                    "judge retry is missing the prior malformed output"
+                )
+            prompt = build_judge_retry_prompt(
+                case,
+                output,
+                judge.prompt,
+                judge.retry_prompt,
+                previous_output,
+                previous_error.code,
+            )
+        started_at = perf_counter_ns()
+        try:
+            response = judge.provider.generate(
+                ProviderRequest(
+                    request_id=judge_request_id(role, case.eval_id),
+                    prompt=prompt,
+                    response_format="json",
+                )
+            )
+        except ProviderError as error:
+            raise ProviderError(
+                f"judge request for evaluation case '{case.eval_id}' failed: {error}"
+            ) from error
+        latency_ms = max(0.0, (perf_counter_ns() - started_at) / 1_000_000)
+        try:
+            result = parse_judge_output(
+                case,
+                response.output,
+                evaluated_output=output,
+                confidence_threshold=judge.confidence_threshold,
+                attempt_count=attempt_number,
+            )
+        except JudgeOutputError as error:
+            with connection:
+                persist_judge_attempt(
+                    connection,
+                    run_id=run_id,
+                    eval_id=case.eval_id,
+                    attempt_number=attempt_number,
+                    request_hash=request_hash(prompt),
+                    raw_output=response.output,
+                    parse_status="malformed",
+                    validation_error=error.diagnostic(),
+                    latency_ms=latency_ms,
+                    provider_metadata=dict(response.metadata),
+                    timestamp=datetime.now(UTC),
+                )
+            if attempt_number == 2:
+                raise ProviderError(
+                    f"judge output for evaluation case '{case.eval_id}' remained "
+                    f"malformed after 2 attempts: {error.code}"
+                ) from error
+            previous_output = response.output
+            previous_error = error
+            continue
+        with connection:
+            persist_judge_attempt(
+                connection,
+                run_id=run_id,
+                eval_id=case.eval_id,
+                attempt_number=attempt_number,
+                request_hash=request_hash(prompt),
+                raw_output=response.output,
+                parse_status="parsed",
+                validation_error=None,
+                latency_ms=latency_ms,
+                provider_metadata=dict(response.metadata),
+                timestamp=datetime.now(UTC),
+            )
+        return result
+    raise AssertionError("judge attempts exhausted without a result")
 
 
 def _record_operational_failure(

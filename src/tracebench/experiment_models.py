@@ -8,7 +8,15 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, Self
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from tracebench.models import EvaluationMode
 
@@ -149,6 +157,100 @@ ProviderConfig = Annotated[
 ]
 
 
+class FixtureJudgeConfig(BaseModel):
+    """Configuration for deterministic fixture-based rubric judging."""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    provider: Literal["fixture"]
+    path: Path
+    prompt_version: str
+    prompt_file: Path
+    retry_prompt_file: Path
+    confidence_threshold: Annotated[float, Field(ge=0.0, le=1.0)]
+
+    @field_validator("prompt_version")
+    @classmethod
+    def normalize_prompt_version(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("must not be blank")
+        return normalized
+
+    @field_validator("path", "prompt_file", "retry_prompt_file", mode="before")
+    @classmethod
+    def reject_blank_paths(cls, value: object) -> object:
+        if isinstance(value, (str, Path)) and not str(value).strip():
+            raise ValueError("must not be blank")
+        return value
+
+    @field_validator("confidence_threshold", mode="before")
+    @classmethod
+    def validate_confidence_threshold(cls, value: object) -> object:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("must be a number, not a boolean or string")
+        return value
+
+
+class OllamaJudgeConfig(BaseModel):
+    """Configuration for rubric judging through an Ollama-compatible server."""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    provider: Literal["ollama"]
+    base_url: str = "http://localhost:11434"
+    model: str
+    prompt_version: str
+    prompt_file: Path
+    retry_prompt_file: Path
+    temperature: Annotated[float, Field(ge=0.0)] = 0.0
+    timeout_seconds: Annotated[float, Field(gt=0.0)] = 120.0
+    seed: Annotated[int | None, Field(ge=0)] = None
+    confidence_threshold: Annotated[float, Field(ge=0.0, le=1.0)]
+
+    @field_validator("base_url")
+    @classmethod
+    def normalize_base_url(cls, value: str) -> str:
+        return OllamaProviderConfig.normalize_base_url(value)
+
+    @field_validator("model", "prompt_version")
+    @classmethod
+    def normalize_nonblank_text(cls, value: str) -> str:
+        return OllamaProviderConfig.normalize_nonblank_provider_text(value)
+
+    @field_validator("prompt_file", "retry_prompt_file", mode="before")
+    @classmethod
+    def reject_blank_prompt_paths(cls, value: object) -> object:
+        if isinstance(value, (str, Path)) and not str(value).strip():
+            raise ValueError("must not be blank")
+        return value
+
+    @field_validator(
+        "temperature",
+        "timeout_seconds",
+        "seed",
+        mode="before",
+    )
+    @classmethod
+    def reject_boolean_numbers(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("must be a number, not a boolean")
+        return value
+
+    @field_validator("confidence_threshold", mode="before")
+    @classmethod
+    def validate_confidence_threshold(cls, value: object) -> object:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("must be a number, not a boolean or string")
+        return value
+
+
+JudgeConfig = Annotated[
+    FixtureJudgeConfig | OllamaJudgeConfig,
+    Field(discriminator="provider"),
+]
+
+
 def _is_valid_hostname(hostname: str) -> bool:
     try:
         ip_address(hostname)
@@ -206,6 +308,7 @@ class ExperimentConfig(BaseModel):
     dataset: str
     baseline: ProviderConfig
     candidate: ProviderConfig
+    judge: JudgeConfig | None = None
     gate: RegressionGateConfig = Field(default_factory=RegressionGateConfig)
 
     @field_validator("name", "dataset")
@@ -238,6 +341,20 @@ class ScorerResult(BaseModel):
     details: dict[str, Any] = Field(default_factory=dict)
 
 
+class JudgeCaseResult(BaseModel):
+    """Validated judge-level fields for one rubric case."""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    response_schema_version: Literal[1] = 1
+    attempt_count: Annotated[int, Field(ge=1, le=2)]
+    overall_score: Annotated[float, Field(ge=0.0, le=1.0)]
+    overall_passed: bool
+    confidence: Annotated[float, Field(ge=0.0, le=1.0)]
+    confidence_threshold: Annotated[float, Field(ge=0.0, le=1.0)]
+    below_confidence_threshold: bool
+
+
 class CaseResult(BaseModel):
     """Provider output and combined scoring outcome for one case."""
 
@@ -249,6 +366,27 @@ class CaseResult(BaseModel):
     score: Annotated[float, Field(ge=0.0, le=1.0)]
     passed: bool
     scorers: Annotated[list[ScorerResult], Field(min_length=1)]
+    judge: JudgeCaseResult | None = None
+
+    @model_validator(mode="after")
+    def require_mode_specific_result(self) -> Self:
+        if self.evaluation_mode is EvaluationMode.RUBRIC and self.judge is None:
+            raise ValueError("rubric result requires judge metadata")
+        if self.evaluation_mode is not EvaluationMode.RUBRIC and self.judge is not None:
+            raise ValueError("non-rubric result forbids judge metadata")
+        return self
+
+    @model_serializer(mode="wrap")
+    def omit_absent_judge(
+        self,
+        handler: SerializerFunctionWrapHandler,
+    ) -> dict[str, Any]:
+        serialized = handler(self)
+        if not isinstance(serialized, dict):
+            raise TypeError("case result must serialize as an object")
+        if self.judge is None:
+            serialized.pop("judge", None)
+        return serialized
 
 
 class RunAggregate(BaseModel):

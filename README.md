@@ -215,8 +215,8 @@ The supported scorer configurations are:
 - `required_keys`: a nonempty, unique list of required top-level JSON object `keys`
 
 Reference-mode cases use implicit case-sensitive exact matching against their
-reference answer. Rubric cases are rejected because the core loop is fully local
-and deterministic.
+reference answer. Rubric cases are evaluated by the experiment's configured judge
+provider, described below.
 
 The YAML gate defaults to zero allowed global score drop and zero newly failed
 cases. Optional `by_mode` entries may override either limit and inherit the other
@@ -241,9 +241,76 @@ Experiment status and verdict are separate. A completed gate decision has status
 | `3` | Operational failure; an accepted attempt is marked failed when possible |
 
 Baseline results, candidate results, and comparison/gate results use separate
-transactions. A failed stage rolls back its partial rows; a follow-up transaction
-records the operational failure. Machine-readable reports are reconstructed from
-the normalized SQLite result, scorer, aggregate, comparison, and violation rows.
+transactions. A failed stage rolls back its partial scored rows; a follow-up
+transaction records the operational failure. Raw judge attempts use independent
+audit transactions so malformed responses remain inspectable after a failed run.
+Machine-readable reports are reconstructed from normalized SQLite rows.
+
+## Rubric judging
+
+An experiment containing rubric cases requires one judge configuration shared by
+the baseline and candidate runs. This local fixture example is suitable for tests
+and CI:
+
+```yaml
+schema_version: 1
+name: rubric-check
+dataset: support-eval:0.1
+baseline: {provider: fixture, path: support-baseline.jsonl}
+candidate: {provider: fixture, path: support-candidate.jsonl}
+judge:
+  provider: fixture
+  path: support-judge.jsonl
+  prompt_version: rubric-v1
+  prompt_file: ../prompts/judges/rubric-v1.txt
+  retry_prompt_file: ../prompts/judges/rubric-retry-v1.txt
+  confidence_threshold: 0.7
+gate:
+  max_score_drop: 0
+  max_new_failures: 0
+```
+
+The checked-in primary prompt is `prompts/judges/rubric-v1.txt`. Prompt paths are
+resolved relative to the experiment YAML and preflighted like answer-provider
+prompts. Prompt version, content hashes, judge settings, and the finite
+`confidence_threshold` in the inclusive range `[0,1]` contribute to the
+configuration hash. Confidence is diagnostic during this checkpoint: a result
+below the threshold is reported but does not alter scores, gates, retries, or exit
+codes.
+
+Judge fixtures contain one strict JSONL record for each rubric case and role. A
+second raw output is optional and is consumed only when the first response is
+malformed:
+
+```json
+{"eval_id":"eval_...","role":"baseline","outputs":["raw response","optional retry response"]}
+```
+
+The judge must return JSON only:
+
+```json
+{"schema_version":1,"criteria":[{"criterion":"Exact rubric criterion text","score":1.0,"passed":true,"reason":"Concise reason"}],"overall_score":1.0,"overall_passed":true,"confidence":0.9}
+```
+
+Scores and confidence are finite numbers in `[0,1]`. Criteria must exactly cover
+the stored rubric text without missing, unknown, or duplicate entries. TraceBench
+uses the equal-weight mean of criterion scores as the case score and requires
+`overall_score` to match within an absolute tolerance of `0.000001` with no
+relative tolerance. A case passes only when every criterion passes, and the
+returned `overall_passed` must agree.
+
+Each criterion appears in the existing nonempty scorer-result list with scorer
+name `rubric`. The additive rubric-only `judge` result contains the validated
+overall fields, confidence, threshold diagnostic, and attempt count. Existing
+deterministic/reference JSON case objects and schema version remain unchanged.
+Raw judge outputs, validation failures, latency, and provider metadata remain
+database-only.
+
+Malformed judge JSON, schema violations, criterion coverage errors, or inconsistent
+overall fields receive at most one retry using the separately versioned retry
+prompt. Configuration, transport, timeout, provider-envelope, persistence, and
+low-confidence outcomes are never retried. Exhausting the retry is an operational
+failure with exit `3` and a null verdict.
 
 ## Local model execution with Ollama
 

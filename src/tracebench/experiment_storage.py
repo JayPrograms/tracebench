@@ -18,6 +18,7 @@ from tracebench.experiment_models import (
     GateReport,
     GateViolation,
     GenerationDetails,
+    JudgeCaseResult,
     RunAggregate,
     RunReport,
     RunRole,
@@ -38,6 +39,7 @@ def insert_attempt(
     run_ids: dict[RunRole, str],
     provider_snapshots: dict[RunRole, dict[str, JsonValue]],
     timestamp: datetime,
+    judge_snapshot: dict[str, JsonValue] | None = None,
 ) -> None:
     """Insert one running attempt and its two pending run records."""
     timestamp_text = timestamp_to_text(timestamp)
@@ -80,6 +82,77 @@ def insert_attempt(
                 _encode_json(snapshot),
             ),
         )
+    if judge_snapshot is not None:
+        provider_name = judge_snapshot.get("provider")
+        prompt_version = judge_snapshot.get("prompt_version")
+        prompt_hash = judge_snapshot.get("prompt_hash")
+        retry_prompt_hash = judge_snapshot.get("retry_prompt_hash")
+        response_schema_version = judge_snapshot.get("response_schema_version")
+        max_malformed_retries = judge_snapshot.get("max_malformed_retries")
+        confidence_threshold = judge_snapshot.get("confidence_threshold")
+        if not isinstance(provider_name, str) or not provider_name.strip():
+            raise ValueError("judge snapshot has no provider")
+        if not isinstance(prompt_version, str) or not prompt_version.strip():
+            raise ValueError("judge snapshot has no prompt version")
+        connection.execute(
+            """
+            INSERT INTO experiment_judges (
+                experiment_id, provider_name, provider_config_json,
+                prompt_version, prompt_hash, retry_prompt_hash,
+                response_schema_version, max_malformed_retries,
+                confidence_threshold
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                experiment_id,
+                provider_name,
+                _encode_json(judge_snapshot),
+                prompt_version,
+                prompt_hash,
+                retry_prompt_hash,
+                response_schema_version,
+                max_malformed_retries,
+                confidence_threshold,
+            ),
+        )
+
+
+def persist_judge_attempt(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    eval_id: str,
+    attempt_number: int,
+    request_hash: str,
+    raw_output: str,
+    parse_status: str,
+    validation_error: str | None,
+    latency_ms: float,
+    provider_metadata: dict[str, JsonValue],
+    timestamp: datetime,
+) -> None:
+    """Persist one received raw judge response independently of run results."""
+    connection.execute(
+        """
+        INSERT INTO experiment_judge_attempts (
+            run_id, eval_id, attempt_number, request_hash, raw_output,
+            parse_status, validation_error, latency_ms,
+            provider_metadata_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            eval_id,
+            attempt_number,
+            request_hash,
+            raw_output,
+            parse_status,
+            validation_error,
+            latency_ms,
+            _encode_json(provider_metadata),
+            timestamp_to_text(timestamp),
+        ),
+    )
 
 
 def start_run(
@@ -152,6 +225,29 @@ def persist_completed_run(
                     scorer.score,
                     int(scorer.passed),
                     _encode_json(scorer.details),
+                ),
+            )
+        if result.judge is not None:
+            judge = result.judge
+            connection.execute(
+                """
+                INSERT INTO experiment_judge_results (
+                    run_id, eval_id, final_attempt_number,
+                    response_schema_version, overall_score, overall_passed,
+                    confidence, confidence_threshold,
+                    below_confidence_threshold
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    result.eval_id,
+                    judge.attempt_count,
+                    judge.response_schema_version,
+                    judge.overall_score,
+                    int(judge.overall_passed),
+                    judge.confidence,
+                    judge.confidence_threshold,
+                    int(judge.below_confidence_threshold),
                 ),
             )
     for aggregate in aggregates:
@@ -470,6 +566,17 @@ def _load_run_report(
             """,
             (run_id, result_row["eval_id"]),
         ).fetchall()
+        judge_row = connection.execute(
+            """
+            SELECT
+                final_attempt_number, response_schema_version,
+                overall_score, overall_passed, confidence,
+                confidence_threshold, below_confidence_threshold
+            FROM experiment_judge_results
+            WHERE run_id = ? AND eval_id = ?
+            """,
+            (run_id, result_row["eval_id"]),
+        ).fetchone()
         results.append(
             CaseResult(
                 eval_id=result_row["eval_id"],
@@ -486,6 +593,21 @@ def _load_run_report(
                     )
                     for scorer_row in scorer_rows
                 ],
+                judge=(
+                    JudgeCaseResult(
+                        response_schema_version=judge_row["response_schema_version"],
+                        attempt_count=judge_row["final_attempt_number"],
+                        overall_score=judge_row["overall_score"],
+                        overall_passed=bool(judge_row["overall_passed"]),
+                        confidence=judge_row["confidence"],
+                        confidence_threshold=judge_row["confidence_threshold"],
+                        below_confidence_threshold=bool(
+                            judge_row["below_confidence_threshold"]
+                        ),
+                    )
+                    if judge_row is not None
+                    else None
+                ),
             )
         )
     aggregate_rows = connection.execute(

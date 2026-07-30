@@ -2,9 +2,10 @@
 
 import json
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -27,28 +28,48 @@ class ProviderResponse:
     metadata: dict[str, JsonValue]
 
 
+@dataclass(frozen=True, slots=True)
+class ProviderRequest:
+    """One fully rendered provider request."""
+
+    request_id: str
+    prompt: str
+    response_format: Literal["text", "json"] = "text"
+
+
 class Provider(Protocol):
     """Minimal synchronous output provider."""
 
-    def generate(self, case: EvalCase) -> ProviderResponse:
-        """Return an output and metadata for one evaluation case."""
+    def generate(self, request: ProviderRequest) -> ProviderResponse:
+        """Return an output and metadata for one prepared request."""
         ...
 
 
 class FixtureProvider:
     """Return prevalidated outputs addressed by stable evaluation ID."""
 
-    def __init__(self, outputs: dict[str, str]) -> None:
+    def __init__(self, outputs: Mapping[str, str | tuple[str, ...]]) -> None:
         self._outputs = dict(outputs)
+        self._calls: dict[str, int] = {}
 
-    def generate(self, case: EvalCase) -> ProviderResponse:
+    def generate(self, request: ProviderRequest) -> ProviderResponse:
         """Return the fixture output, including an intentionally empty string."""
         try:
-            return ProviderResponse(output=self._outputs[case.eval_id], metadata={})
+            configured_output = self._outputs[request.request_id]
         except KeyError as error:
             raise ProviderError(
-                f"fixture has no output for evaluation case '{case.eval_id}'"
+                f"fixture has no output for request '{request.request_id}'"
             ) from error
+        if isinstance(configured_output, str):
+            return ProviderResponse(output=configured_output, metadata={})
+        call_index = self._calls.get(request.request_id, 0)
+        if call_index >= len(configured_output):
+            raise ProviderError(
+                f"fixture has no output for request '{request.request_id}' "
+                f"attempt {call_index + 1}"
+            )
+        self._calls[request.request_id] = call_index + 1
+        return ProviderResponse(output=configured_output[call_index], metadata={})
 
 
 class OllamaProvider:
@@ -59,30 +80,30 @@ class OllamaProvider:
         *,
         base_url: str,
         model: str,
-        system_prompt: str,
         temperature: float,
         timeout_seconds: float,
         seed: int | None,
     ) -> None:
         self._endpoint = f"{base_url.rstrip('/')}/api/generate"
         self._model = model
-        self._system_prompt = system_prompt
         self._temperature = temperature
         self._timeout_seconds = timeout_seconds
         self._seed = seed
 
-    def generate(self, case: EvalCase) -> ProviderResponse:
+    def generate(self, request: ProviderRequest) -> ProviderResponse:
         """Send one non-streaming generation request."""
         options: dict[str, JsonValue] = {"temperature": self._temperature}
         if self._seed is not None:
             options["seed"] = self._seed
         payload: dict[str, JsonValue] = {
             "model": self._model,
-            "prompt": build_prompt(case, self._system_prompt),
+            "prompt": request.prompt,
             "stream": False,
             "options": options,
         }
-        request = Request(
+        if request.response_format == "json":
+            payload["format"] = "json"
+        http_request = Request(
             self._endpoint,
             data=json.dumps(
                 payload,
@@ -94,7 +115,7 @@ class OllamaProvider:
             method="POST",
         )
         try:
-            with urlopen(request, timeout=self._timeout_seconds) as response:
+            with urlopen(http_request, timeout=self._timeout_seconds) as response:
                 body = response.read()
         except HTTPError as error:
             detail = _http_error_detail(error)

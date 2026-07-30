@@ -1,5 +1,7 @@
 """Strict YAML loading and complete experiment preflight."""
 
+from __future__ import annotations
+
 import hashlib
 import json
 from dataclasses import dataclass
@@ -15,9 +17,16 @@ from tracebench.datasets import DatasetError, get_dataset_and_cases
 from tracebench.experiment_models import (
     EffectiveThresholds,
     ExperimentConfig,
+    FixtureJudgeConfig,
     FixtureProviderConfig,
+    OllamaJudgeConfig,
     OllamaProviderConfig,
     RunRole,
+)
+from tracebench.judges import (
+    JUDGE_RESPONSE_SCHEMA_VERSION,
+    MAX_MALFORMED_RETRIES,
+    load_judge_fixture,
 )
 from tracebench.models import EvalCase, EvalDataset, EvaluationMode
 from tracebench.providers import (
@@ -82,10 +91,23 @@ class PreparedExperiment:
     dataset: EvalDataset
     cases: tuple[EvalCase, ...]
     providers: dict[RunRole, Provider]
+    provider_prompts: dict[RunRole, str | None]
+    judge: PreparedJudge | None
     effective_thresholds: dict[str, EffectiveThresholds]
     configuration_hash: str
     configuration_json: str
     provider_snapshots: dict[RunRole, dict[str, JsonValue]]
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedJudge:
+    """Fully materialized judge configuration and provider."""
+
+    provider: Provider
+    prompt: str
+    retry_prompt: str
+    confidence_threshold: float
+    snapshot: dict[str, JsonValue]
 
 
 def prepare_experiment(
@@ -107,10 +129,13 @@ def prepare_experiment(
     rubric_cases = [
         case.eval_id for case in cases if case.evaluation_mode is EvaluationMode.RUBRIC
     ]
-    if rubric_cases:
+    if rubric_cases and config.judge is None:
         raise ExperimentPreflightError(
-            "rubric evaluation is not supported by the deterministic core loop: "
-            + ", ".join(rubric_cases)
+            "rubric evaluation requires a configured judge: " + ", ".join(rubric_cases)
+        )
+    if not rubric_cases and config.judge is not None:
+        raise ExperimentPreflightError(
+            "judge configuration requires rubric cases in the dataset"
         )
 
     present_modes = {case.evaluation_mode for case in cases}
@@ -134,6 +159,7 @@ def prepare_experiment(
     expected_ids = {case.eval_id for case in cases}
     config_parent = config_path.resolve().parent
     providers: dict[RunRole, Provider] = {}
+    provider_prompts: dict[RunRole, str | None] = {}
     provider_snapshots: dict[RunRole, dict[str, JsonValue]] = {}
     canonical_providers: dict[RunRole, dict[str, JsonValue]] = {}
     for role, provider_config in (
@@ -149,6 +175,7 @@ def prepare_experiment(
             except ProviderError as error:
                 raise ExperimentPreflightError(str(error)) from error
             providers[role] = FixtureProvider(outputs)
+            provider_prompts[role] = None
             provider_snapshots[role] = {
                 "provider": "fixture",
                 "fixture_hash": hashlib.sha256(
@@ -172,11 +199,11 @@ def prepare_experiment(
             providers[role] = OllamaProvider(
                 base_url=provider_config.base_url,
                 model=provider_config.model,
-                system_prompt=system_prompt,
                 temperature=provider_config.temperature,
                 timeout_seconds=provider_config.timeout_seconds,
                 seed=provider_config.seed,
             )
+            provider_prompts[role] = system_prompt
             snapshot: dict[str, JsonValue] = {
                 "provider": "ollama",
                 "base_url": provider_config.base_url,
@@ -192,12 +219,85 @@ def prepare_experiment(
         else:
             raise AssertionError("unreachable provider configuration")
 
+    prepared_judge: PreparedJudge | None = None
+    canonical_judge: dict[str, JsonValue] | None = None
+    if config.judge is not None:
+        judge_config = config.judge
+        prompt_path = judge_config.prompt_file
+        if not prompt_path.is_absolute():
+            prompt_path = config_parent / prompt_path
+        retry_prompt_path = judge_config.retry_prompt_file
+        if not retry_prompt_path.is_absolute():
+            retry_prompt_path = config_parent / retry_prompt_path
+        prompt, prompt_hash = _load_prompt(prompt_path.resolve(), "judge prompt")
+        retry_prompt, retry_prompt_hash = _load_prompt(
+            retry_prompt_path.resolve(), "judge retry prompt"
+        )
+        common_snapshot: dict[str, JsonValue] = {
+            "prompt_version": judge_config.prompt_version,
+            "prompt_hash": prompt_hash,
+            "retry_prompt_hash": retry_prompt_hash,
+            "response_schema_version": JUDGE_RESPONSE_SCHEMA_VERSION,
+            "max_malformed_retries": MAX_MALFORMED_RETRIES,
+            "confidence_threshold": judge_config.confidence_threshold,
+        }
+        rubric_ids = set(rubric_cases)
+        if isinstance(judge_config, FixtureJudgeConfig):
+            fixture_path = judge_config.path
+            if not fixture_path.is_absolute():
+                fixture_path = config_parent / fixture_path
+            try:
+                judge_outputs = load_judge_fixture(fixture_path.resolve(), rubric_ids)
+            except ProviderError as error:
+                raise ExperimentPreflightError(str(error)) from error
+            judge_provider: Provider = FixtureProvider(judge_outputs)
+            snapshot = {
+                "provider": "fixture",
+                "fixture_hash": hashlib.sha256(
+                    _encode_canonical(judge_outputs).encode("utf-8")
+                ).hexdigest(),
+                **common_snapshot,
+            }
+            canonical_judge = {
+                "provider": "fixture",
+                "outputs": {key: list(value) for key, value in judge_outputs.items()},
+                **common_snapshot,
+            }
+        elif isinstance(judge_config, OllamaJudgeConfig):
+            judge_provider = OllamaProvider(
+                base_url=judge_config.base_url,
+                model=judge_config.model,
+                temperature=judge_config.temperature,
+                timeout_seconds=judge_config.timeout_seconds,
+                seed=judge_config.seed,
+            )
+            snapshot = {
+                "provider": "ollama",
+                "base_url": judge_config.base_url,
+                "model": judge_config.model,
+                "temperature": judge_config.temperature,
+                "timeout_seconds": judge_config.timeout_seconds,
+                "seed": judge_config.seed,
+                **common_snapshot,
+            }
+            canonical_judge = dict(snapshot)
+        else:
+            raise AssertionError("unreachable judge configuration")
+        prepared_judge = PreparedJudge(
+            provider=judge_provider,
+            prompt=prompt,
+            retry_prompt=retry_prompt,
+            confidence_threshold=judge_config.confidence_threshold,
+            snapshot=snapshot,
+        )
+
     effective_thresholds = _effective_thresholds(config)
     canonical = _canonical_configuration(
         config=config,
         dataset=dataset,
         cases=cases,
         canonical_providers=canonical_providers,
+        canonical_judge=canonical_judge,
         effective_thresholds=effective_thresholds,
     )
     configuration_json = _encode_canonical(canonical)
@@ -206,6 +306,8 @@ def prepare_experiment(
         dataset=dataset,
         cases=cases,
         providers=providers,
+        provider_prompts=provider_prompts,
+        judge=prepared_judge,
         effective_thresholds=effective_thresholds,
         configuration_hash=hashlib.sha256(
             configuration_json.encode("utf-8")
@@ -281,10 +383,12 @@ def _canonical_configuration(
     dataset: EvalDataset,
     cases: tuple[EvalCase, ...],
     canonical_providers: dict[RunRole, dict[str, JsonValue]],
+    canonical_judge: dict[str, JsonValue] | None,
     effective_thresholds: dict[str, EffectiveThresholds],
 ) -> dict[str, object]:
-    case_definitions = [
-        {
+    case_definitions: list[dict[str, object]] = []
+    for case in cases:
+        definition: dict[str, object] = {
             "eval_id": case.eval_id,
             "input": case.input,
             "context": case.context,
@@ -292,9 +396,11 @@ def _canonical_configuration(
             "reference_answer": case.reference_answer,
             "scorers": [scorer.model_dump(mode="json") for scorer in case.scorers],
         }
-        for case in cases
-    ]
-    return {
+        if case.evaluation_mode is EvaluationMode.RUBRIC:
+            definition["rubric"] = list(case.rubric)
+            definition["priority"] = case.priority.value
+        case_definitions.append(definition)
+    canonical: dict[str, object] = {
         "schema_version": config.schema_version,
         "dataset": {
             "dataset_id": dataset.dataset_id,
@@ -309,6 +415,9 @@ def _canonical_configuration(
             for scope, thresholds in sorted(effective_thresholds.items())
         },
     }
+    if canonical_judge is not None:
+        canonical["judge"] = canonical_judge
+    return canonical
 
 
 def _encode_canonical(value: object) -> str:
@@ -322,13 +431,17 @@ def _encode_canonical(value: object) -> str:
 
 
 def _load_system_prompt(path: Path) -> tuple[str, str]:
+    return _load_prompt(path, "system prompt")
+
+
+def _load_prompt(path: Path, description: str) -> tuple[str, str]:
     try:
         contents = path.read_bytes().decode("utf-8-sig")
     except (OSError, UnicodeError) as error:
         raise ExperimentPreflightError(
-            f"could not read system prompt {path}: {error}"
+            f"could not read {description} {path}: {error}"
         ) from error
     if not contents.strip():
-        raise ExperimentPreflightError(f"system prompt {path} must not be blank")
+        raise ExperimentPreflightError(f"{description} {path} must not be blank")
     content_hash = hashlib.sha256(contents.encode("utf-8")).hexdigest()
     return contents, content_hash

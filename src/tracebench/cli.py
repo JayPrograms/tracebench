@@ -350,6 +350,20 @@ def _print_experiment_report(report: ExperimentReport) -> None:
     typer.echo(f"Candidate score: {candidate.global_.score:.6f}")
     typer.echo(f"Newly passed: {len(report.comparison.newly_passed)}")
     typer.echo(f"Newly failed: {len(report.comparison.newly_failed)}")
+    rubric_results = [
+        case
+        for run in (baseline, candidate)
+        for case in run.cases
+        if case.judge is not None
+    ]
+    if rubric_results:
+        for label, run in (("Baseline", baseline), ("Candidate", candidate)):
+            low_confidence = sum(
+                case.judge.below_confidence_threshold
+                for case in run.cases
+                if case.judge is not None
+            )
+            typer.echo(f"{label} low-confidence rubric cases: {low_confidence}")
     for violation in report.gate.violations:
         typer.echo(f"Violation: {violation.message}")
 

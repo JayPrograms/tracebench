@@ -25,7 +25,12 @@ from tracebench.experiment_models import RunRole
 from tracebench.experiment_storage import load_experiment_report
 from tracebench.experiments import ExperimentOperationalError, execute_experiment
 from tracebench.models import EvalCase, EvaluationMode, Trace
-from tracebench.providers import OllamaProvider, ProviderError, build_prompt
+from tracebench.providers import (
+    OllamaProvider,
+    ProviderError,
+    ProviderRequest,
+    build_prompt,
+)
 from tracebench.storage import connect_database, insert_trace
 
 runner = CliRunner()
@@ -111,10 +116,19 @@ def ollama_provider(*, seed: int | None = 7) -> OllamaProvider:
     return OllamaProvider(
         base_url="http://localhost:11434",
         model="llama3.2:3b",
-        system_prompt="Answer directly.",
         temperature=0.25,
         timeout_seconds=12,
         seed=seed,
+    )
+
+
+def provider_request(
+    case: EvalCase, prompt: str = "Answer directly."
+) -> ProviderRequest:
+    """Render the request accepted by the shared provider protocol."""
+    return ProviderRequest(
+        request_id=case.eval_id,
+        prompt=build_prompt(case, prompt),
     )
 
 
@@ -167,7 +181,7 @@ def test_ollama_request_and_response_metadata(
 
     monkeypatch.setattr(provider_module, "urlopen", fake_urlopen)
 
-    response = ollama_provider().generate(case)
+    response = ollama_provider().generate(provider_request(case))
 
     request = captured["request"]
     assert isinstance(request, Request)
@@ -202,6 +216,31 @@ def test_ollama_request_and_response_metadata(
     }
 
 
+def test_ollama_json_mode_is_selected_by_provider_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Judge requests add Ollama JSON mode without changing text requests."""
+    captured: list[dict[str, Any]] = []
+
+    def fake_urlopen(request: Request, timeout: float) -> StubResponse:
+        assert request.data is not None
+        captured.append(json.loads(request.data))
+        return StubResponse(b'{"response":"{}","done":true}')
+
+    monkeypatch.setattr(provider_module, "urlopen", fake_urlopen)
+
+    response = ollama_provider().generate(
+        ProviderRequest(
+            request_id="baseline:eval_rubric",
+            prompt="judge",
+            response_format="json",
+        )
+    )
+
+    assert response.output == "{}"
+    assert captured[0]["format"] == "json"
+
+
 def test_ollama_omits_unset_seed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -217,7 +256,7 @@ def test_ollama_omits_unset_seed(
 
     monkeypatch.setattr(provider_module, "urlopen", fake_urlopen)
 
-    response = ollama_provider(seed=None).generate(case)
+    response = ollama_provider(seed=None).generate(provider_request(case))
 
     assert response.output == ""
     assert captured[0]["options"] == {"temperature": 0.25}
@@ -251,7 +290,7 @@ def test_ollama_rejects_invalid_responses(
     )
 
     with pytest.raises(ProviderError, match=message):
-        ollama_provider().generate(case)
+        ollama_provider().generate(provider_request(case))
 
 
 def test_ollama_reports_http_connection_and_timeout_failures(
@@ -272,21 +311,21 @@ def test_ollama_reports_http_connection_and_timeout_failures(
 
     monkeypatch.setattr(provider_module, "urlopen", raise_http)
     with pytest.raises(ProviderError, match="HTTP 404: model not found"):
-        ollama_provider().generate(case)
+        ollama_provider().generate(provider_request(case))
 
     def raise_connection(request: Request, timeout: float) -> StubResponse:
         raise URLError(ConnectionRefusedError("refused"))
 
     monkeypatch.setattr(provider_module, "urlopen", raise_connection)
     with pytest.raises(ProviderError, match="could not connect to Ollama"):
-        ollama_provider().generate(case)
+        ollama_provider().generate(provider_request(case))
 
     def raise_timeout(request: Request, timeout: float) -> StubResponse:
         raise URLError(TimeoutError("timed out"))
 
     monkeypatch.setattr(provider_module, "urlopen", raise_timeout)
     with pytest.raises(ProviderError, match="timed out after 12 seconds"):
-        ollama_provider().generate(case)
+        ollama_provider().generate(provider_request(case))
 
 
 def test_relative_prompt_is_preflighted_and_snapshot_is_path_free(
@@ -337,7 +376,15 @@ def test_system_prompt_preserves_crlf_content_and_hash(
     monkeypatch.setattr(provider_module, "urlopen", fake_urlopen)
 
     prepared = prepare_experiment(config_path, database_path)
-    prepared.providers[RunRole.BASELINE].generate(case)
+    prepared.providers[RunRole.BASELINE].generate(
+        ProviderRequest(
+            request_id=case.eval_id,
+            prompt=build_prompt(
+                case,
+                prepared.provider_prompts[RunRole.BASELINE] or "",
+            ),
+        )
+    )
 
     expected_hash = sha256(decoded_prompt.encode("utf-8")).hexdigest()
     normalized_lf_hash = sha256(
@@ -632,6 +679,8 @@ candidate: {provider: fixture, path: candidate.jsonl}
         connection.execute("PRAGMA foreign_keys = OFF")
         connection.execute("DROP TRIGGER validate_experiment_result_relation_insert")
         connection.execute("DROP TRIGGER validate_experiment_result_relation_update")
+        connection.execute("DROP TRIGGER validate_judge_attempt_relation_insert")
+        connection.execute("DROP TRIGGER validate_judge_attempt_relation_update")
         connection.execute(
             """
             CREATE TABLE experiment_runs_old (

@@ -104,7 +104,7 @@ _CONFIG_MODELS: dict[str, type[BaseModel]] = {
 def validate_case_scorers(case: EvalCase) -> None:
     """Validate every scorer required to execute one case."""
     if case.evaluation_mode is EvaluationMode.RUBRIC:
-        raise ScorerConfigurationError("rubric evaluation is not deterministic")
+        return
     if case.evaluation_mode is EvaluationMode.REFERENCE:
         return
     for scorer in case.scorers:
