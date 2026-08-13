@@ -21,7 +21,11 @@ from tracebench.datasets import (
     promote_trace,
 )
 from tracebench.experiment_config import ExperimentPreflightError
-from tracebench.experiment_models import ExperimentReport, ExperimentVerdict
+from tracebench.experiment_models import (
+    ExperimentReport,
+    ExperimentVerdict,
+    JudgeReviewStatus,
+)
 from tracebench.experiments import ExperimentOperationalError, execute_experiment
 from tracebench.ingestion import IngestionSummary, ingest_file
 from tracebench.models import (
@@ -358,12 +362,26 @@ def _print_experiment_report(report: ExperimentReport) -> None:
     ]
     if rubric_results:
         for label, run in (("Baseline", baseline), ("Candidate", candidate)):
+            judge_results = [case.judge for case in run.cases if case.judge is not None]
             low_confidence = sum(
-                case.judge.below_confidence_threshold
-                for case in run.cases
-                if case.judge is not None
+                judge.below_confidence_threshold for judge in judge_results
             )
             typer.echo(f"{label} low-confidence rubric cases: {low_confidence}")
+            cache_hits = sum(judge.cache_hit is True for judge in judge_results)
+            cache_misses = sum(judge.cache_hit is False for judge in judge_results)
+            typer.echo(
+                f"{label} rubric judge cache: "
+                f"{cache_hits} hit(s), {cache_misses} miss(es)"
+            )
+            needs_review = [
+                case.eval_id
+                for case in run.cases
+                if case.judge is not None
+                and case.judge.review.status is JudgeReviewStatus.NEEDS_REVIEW
+            ]
+            typer.echo(f"{label} rubric cases needing review: {len(needs_review)}")
+            for eval_id in needs_review:
+                typer.echo(f"Needs review: {label.lower()}:{eval_id}")
     for violation in report.gate.violations:
         typer.echo(f"Violation: {violation.message}")
 

@@ -681,6 +681,8 @@ candidate: {provider: fixture, path: candidate.jsonl}
         connection.execute("DROP TRIGGER validate_experiment_result_relation_update")
         connection.execute("DROP TRIGGER validate_judge_attempt_relation_insert")
         connection.execute("DROP TRIGGER validate_judge_attempt_relation_update")
+        connection.execute("DROP TRIGGER validate_judge_cache_lookup_relation_insert")
+        connection.execute("DROP TRIGGER validate_judge_cache_lookup_relation_update")
         connection.execute(
             """
             CREATE TABLE experiment_runs_old (

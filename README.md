@@ -20,7 +20,8 @@ TraceBench is local-first and designed to work without paid services.
 
 TraceBench supports importing application traces, promoting selected traces into
 versioned evaluation datasets, and running persisted baseline-versus-candidate
-experiments with deterministic regression gates.
+experiments with deterministic regression gates, rubric judging, immutable judge
+result caching, and human-review escalation metadata.
 
 ## Trace ingestion
 
@@ -244,7 +245,9 @@ Baseline results, candidate results, and comparison/gate results use separate
 transactions. A failed stage rolls back its partial scored rows; a follow-up
 transaction records the operational failure. Raw judge attempts use independent
 audit transactions so malformed responses remain inspectable after a failed run.
-Machine-readable reports are reconstructed from normalized SQLite rows.
+Judge cache lookups and inserts also use short transactions that never remain open
+while waiting for a provider. Machine-readable reports are reconstructed from
+normalized SQLite rows.
 
 ## Rubric judging
 
@@ -274,9 +277,8 @@ The checked-in primary prompt is `prompts/judges/rubric-v1.txt`. Prompt paths ar
 resolved relative to the experiment YAML and preflighted like answer-provider
 prompts. Prompt version, content hashes, judge settings, and the finite
 `confidence_threshold` in the inclusive range `[0,1]` contribute to the
-configuration hash. Confidence is diagnostic during this checkpoint: a result
-below the threshold is reported but does not alter scores, gates, retries, or exit
-codes.
+configuration hash. A result below the threshold requires human review but does
+not alter scores, gates, retries, verdicts, or exit codes.
 
 Judge fixtures contain one strict JSONL record for each rubric case and role. A
 second raw output is optional and is consumed only when the first response is
@@ -301,10 +303,41 @@ returned `overall_passed` must agree.
 
 Each criterion appears in the existing nonempty scorer-result list with scorer
 name `rubric`. The additive rubric-only `judge` result contains the validated
-overall fields, confidence, threshold diagnostic, and attempt count. Existing
-deterministic/reference JSON case objects and schema version remain unchanged.
-Raw judge outputs, validation failures, latency, and provider metadata remain
-database-only.
+overall fields, confidence, threshold diagnostic, attempt count, cache metadata,
+and review state. `cache_hit` is always `true` or `false` for a new result; an
+in-place migration represents historical A2 results with `null`. Cache hits have
+zero attempts because no provider call occurs. Existing deterministic/reference
+JSON case objects, the top-level report schema version, and operational-failure
+JSON remain unchanged at version `1`. Raw judge outputs, cached response content,
+validation failures, latency, and provider metadata remain database-only.
+
+Successful rubric responses are cached by a SHA-256 identity covering the exact
+evaluated output, ordered rubric, other rendered judge inputs, prompt version and
+content hashes, judge model/provider identity, and every configured setting that
+affects generation. Confidence threshold and timeout are excluded because they do
+not affect a successful generation. Threshold changes can therefore reuse a
+response while deriving a new review state.
+
+Each immutable cache entry retains both the exact successful provider output and a
+canonical parsed response. `response_hash` is the SHA-256 hash of the canonical
+parsed JSON, not the raw string. Every hit validates the key identity, canonical
+JSON, hash, and that the retained raw output strictly parses into the same
+canonical response. Any mismatch is an operational integrity failure; TraceBench
+does not overwrite the entry or fall back to the provider. Malformed outputs and
+provider failures are never cached. When a malformed first response is repaired,
+only the exact successful retry output enters the cache.
+
+Concurrent callers may both observe a miss and generate without holding a
+database write lock. The first valid cache insert wins immutably for future hits.
+If another caller produced a different valid response, its run remains a miss and
+uses its own audited response; it does not claim that the winning cache row was
+the source of its result.
+
+Rubric results use the review states `not_required`, `needs_review`, and
+`reviewed`. Low confidence or failure of a `critical`-priority case produces
+`needs_review`, with both reasons retained when applicable. `reviewed` is reserved
+for a future review-editing workflow; this release adds no review-editing command
+or UI.
 
 Malformed judge JSON, schema violations, criterion coverage errors, or inconsistent
 overall fields receive at most one retry using the separately versioned retry

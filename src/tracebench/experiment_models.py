@@ -53,6 +53,29 @@ class RunStatus(StrEnum):
     SKIPPED = "skipped"
 
 
+class JudgeCacheStatus(StrEnum):
+    """Cache lookup outcome for one rubric judge result."""
+
+    HIT = "hit"
+    MISS = "miss"
+    NOT_RECORDED = "not_recorded"
+
+
+class JudgeReviewStatus(StrEnum):
+    """Human-review state for one rubric judge result."""
+
+    NOT_REQUIRED = "not_required"
+    NEEDS_REVIEW = "needs_review"
+    REVIEWED = "reviewed"
+
+
+class JudgeReviewReason(StrEnum):
+    """Reason a rubric judge result requires or received review."""
+
+    LOW_CONFIDENCE = "low_confidence"
+    CRITICAL_FAILURE = "critical_failure"
+
+
 @dataclass(frozen=True, slots=True)
 class GenerationDetails:
     """Persistable observations from one provider call."""
@@ -341,18 +364,113 @@ class ScorerResult(BaseModel):
     details: dict[str, Any] = Field(default_factory=dict)
 
 
+class JudgeCacheMetadata(BaseModel):
+    """Persisted cache lookup metadata exposed for one rubric result."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    key: str | None
+    status: JudgeCacheStatus
+
+    @model_validator(mode="after")
+    def require_status_specific_key(self) -> Self:
+        if self.status is JudgeCacheStatus.NOT_RECORDED:
+            if self.key is not None:
+                raise ValueError("not-recorded cache metadata forbids a key")
+            return self
+        if self.key is None or re.fullmatch(r"[0-9a-f]{64}", self.key) is None:
+            raise ValueError("cache hits and misses require a lowercase SHA-256 key")
+        return self
+
+
+class JudgeReviewMetadata(BaseModel):
+    """Human-review state and its deterministic escalation reasons."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    status: JudgeReviewStatus
+    reasons: list[JudgeReviewReason]
+
+    @model_validator(mode="after")
+    def require_status_specific_reasons(self) -> Self:
+        if len(set(self.reasons)) != len(self.reasons):
+            raise ValueError("review reasons must be unique")
+        if self.status is JudgeReviewStatus.NOT_REQUIRED and self.reasons:
+            raise ValueError("not-required review metadata forbids reasons")
+        if self.status is not JudgeReviewStatus.NOT_REQUIRED and not self.reasons:
+            raise ValueError("reviewed results require at least one reason")
+        return self
+
+
 class JudgeCaseResult(BaseModel):
     """Validated judge-level fields for one rubric case."""
 
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
     response_schema_version: Literal[1] = 1
-    attempt_count: Annotated[int, Field(ge=1, le=2)]
+    attempt_count: Annotated[int, Field(ge=0, le=2)]
     overall_score: Annotated[float, Field(ge=0.0, le=1.0)]
     overall_passed: bool
     confidence: Annotated[float, Field(ge=0.0, le=1.0)]
     confidence_threshold: Annotated[float, Field(ge=0.0, le=1.0)]
     below_confidence_threshold: bool
+    cache_hit: bool | None = None
+    cache: JudgeCacheMetadata = Field(
+        default_factory=lambda: JudgeCacheMetadata(
+            key=None,
+            status=JudgeCacheStatus.NOT_RECORDED,
+        )
+    )
+    review: JudgeReviewMetadata
+
+    @model_validator(mode="before")
+    @classmethod
+    def default_additive_review_metadata(cls, value: Any) -> Any:
+        """Keep A2 constructors valid while deriving the new additive field."""
+        if not isinstance(value, dict) or "review" in value:
+            return value
+        prepared = dict(value)
+        reasons = (
+            [JudgeReviewReason.LOW_CONFIDENCE]
+            if prepared.get("below_confidence_threshold") is True
+            else []
+        )
+        prepared["review"] = {
+            "status": (
+                JudgeReviewStatus.NEEDS_REVIEW
+                if reasons
+                else JudgeReviewStatus.NOT_REQUIRED
+            ),
+            "reasons": reasons,
+        }
+        return prepared
+
+    @model_validator(mode="after")
+    def require_consistent_cache_metadata(self) -> Self:
+        if self.cache_hit is True:
+            if self.cache.status is not JudgeCacheStatus.HIT or self.attempt_count != 0:
+                raise ValueError("cache hits require hit metadata and zero attempts")
+        elif self.cache_hit is False:
+            if self.cache.status is not JudgeCacheStatus.MISS:
+                raise ValueError("cache misses require miss metadata")
+            if self.attempt_count not in (1, 2):
+                raise ValueError("cache misses require one or two attempts")
+        else:
+            if self.cache.status is not JudgeCacheStatus.NOT_RECORDED:
+                raise ValueError("unknown cache state requires not-recorded metadata")
+            if self.attempt_count not in (1, 2):
+                raise ValueError("historical results require one or two attempts")
+        has_low_confidence_reason = (
+            JudgeReviewReason.LOW_CONFIDENCE in self.review.reasons
+        )
+        if has_low_confidence_reason is not self.below_confidence_threshold:
+            raise ValueError("low-confidence review metadata is inconsistent")
+        if (
+            JudgeReviewReason.CRITICAL_FAILURE in self.review.reasons
+            and self.overall_passed
+        ):
+            raise ValueError("critical-failure review metadata requires failure")
+        return self
 
 
 class CaseResult(BaseModel):

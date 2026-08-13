@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime
 
 from tracebench.experiment_models import (
@@ -18,7 +19,12 @@ from tracebench.experiment_models import (
     GateReport,
     GateViolation,
     GenerationDetails,
+    JudgeCacheMetadata,
+    JudgeCacheStatus,
     JudgeCaseResult,
+    JudgeReviewMetadata,
+    JudgeReviewReason,
+    JudgeReviewStatus,
     RunAggregate,
     RunReport,
     RunRole,
@@ -26,6 +32,19 @@ from tracebench.experiment_models import (
 )
 from tracebench.providers import JsonValue
 from tracebench.storage import timestamp_to_text
+
+
+@dataclass(frozen=True, slots=True)
+class JudgeCacheEntry:
+    """One immutable cached raw and canonical successful judge response."""
+
+    cache_key: str
+    key_version: int
+    identity_json: str
+    response_schema_version: int
+    response_json: str
+    response_hash: str
+    raw_output: str
 
 
 def insert_attempt(
@@ -155,6 +174,99 @@ def persist_judge_attempt(
     )
 
 
+def load_judge_cache_entry(
+    connection: sqlite3.Connection,
+    cache_key: str,
+) -> JudgeCacheEntry | None:
+    """Load one immutable cached judge response by request identity."""
+    row = connection.execute(
+        """
+        SELECT
+            cache_key, key_version, identity_json,
+            response_schema_version, response_json,
+            response_hash, raw_output
+        FROM judge_result_cache
+        WHERE cache_key = ?
+        """,
+        (cache_key,),
+    ).fetchone()
+    if row is None:
+        return None
+    return JudgeCacheEntry(
+        cache_key=row["cache_key"],
+        key_version=row["key_version"],
+        identity_json=row["identity_json"],
+        response_schema_version=row["response_schema_version"],
+        response_json=row["response_json"],
+        response_hash=row["response_hash"],
+        raw_output=row["raw_output"],
+    )
+
+
+def insert_judge_cache_entry(
+    connection: sqlite3.Connection,
+    *,
+    cache_key: str,
+    key_version: int,
+    identity_json: str,
+    response_schema_version: int,
+    response_json: str,
+    response_hash: str,
+    raw_output: str,
+    timestamp: datetime,
+) -> bool:
+    """Insert a validated cache entry without replacing an existing winner."""
+    cursor = connection.execute(
+        """
+        INSERT INTO judge_result_cache (
+            cache_key, key_version, identity_json,
+            response_schema_version, response_json,
+            response_hash, raw_output, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT DO NOTHING
+        """,
+        (
+            cache_key,
+            key_version,
+            identity_json,
+            response_schema_version,
+            response_json,
+            response_hash,
+            raw_output,
+            timestamp_to_text(timestamp),
+        ),
+    )
+    return cursor.rowcount == 1
+
+
+def persist_judge_cache_lookup(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    eval_id: str,
+    cache_key: str,
+    cache_status: JudgeCacheStatus,
+    timestamp: datetime,
+) -> None:
+    """Persist the cache lookup outcome before any possible provider call."""
+    if cache_status is JudgeCacheStatus.NOT_RECORDED:
+        raise ValueError("new judge cache lookups must be hits or misses")
+    connection.execute(
+        """
+        INSERT INTO experiment_judge_cache_lookups (
+            run_id, eval_id, cache_key, cache_status, created_at
+        ) VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            eval_id,
+            cache_key,
+            cache_status.value,
+            timestamp_to_text(timestamp),
+        ),
+    )
+
+
 def start_run(
     connection: sqlite3.Connection,
     run_id: str,
@@ -235,19 +347,23 @@ def persist_completed_run(
                     run_id, eval_id, final_attempt_number,
                     response_schema_version, overall_score, overall_passed,
                     confidence, confidence_threshold,
-                    below_confidence_threshold
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    below_confidence_threshold, cache_hit,
+                    critical_priority_failure, review_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
                     result.eval_id,
-                    judge.attempt_count,
+                    (None if judge.cache_hit is True else judge.attempt_count),
                     judge.response_schema_version,
                     judge.overall_score,
                     int(judge.overall_passed),
                     judge.confidence,
                     judge.confidence_threshold,
                     int(judge.below_confidence_threshold),
+                    (None if judge.cache_hit is None else int(judge.cache_hit)),
+                    int(JudgeReviewReason.CRITICAL_FAILURE in judge.review.reasons),
+                    judge.review.status.value,
                 ),
             )
     for aggregate in aggregates:
@@ -569,11 +685,23 @@ def _load_run_report(
         judge_row = connection.execute(
             """
             SELECT
-                final_attempt_number, response_schema_version,
-                overall_score, overall_passed, confidence,
-                confidence_threshold, below_confidence_threshold
-            FROM experiment_judge_results
-            WHERE run_id = ? AND eval_id = ?
+                result.final_attempt_number,
+                result.response_schema_version,
+                result.overall_score,
+                result.overall_passed,
+                result.confidence,
+                result.confidence_threshold,
+                result.below_confidence_threshold,
+                result.cache_hit,
+                result.critical_priority_failure,
+                result.review_status,
+                lookup.cache_key,
+                lookup.cache_status
+            FROM experiment_judge_results AS result
+            JOIN experiment_judge_cache_lookups AS lookup
+                ON lookup.run_id = result.run_id
+                AND lookup.eval_id = result.eval_id
+            WHERE result.run_id = ? AND result.eval_id = ?
             """,
             (run_id, result_row["eval_id"]),
         ).fetchone()
@@ -596,13 +724,43 @@ def _load_run_report(
                 judge=(
                     JudgeCaseResult(
                         response_schema_version=judge_row["response_schema_version"],
-                        attempt_count=judge_row["final_attempt_number"],
+                        attempt_count=(
+                            0
+                            if judge_row["final_attempt_number"] is None
+                            else judge_row["final_attempt_number"]
+                        ),
                         overall_score=judge_row["overall_score"],
                         overall_passed=bool(judge_row["overall_passed"]),
                         confidence=judge_row["confidence"],
                         confidence_threshold=judge_row["confidence_threshold"],
                         below_confidence_threshold=bool(
                             judge_row["below_confidence_threshold"]
+                        ),
+                        cache_hit=(
+                            None
+                            if judge_row["cache_hit"] is None
+                            else bool(judge_row["cache_hit"])
+                        ),
+                        cache=JudgeCacheMetadata(
+                            key=judge_row["cache_key"],
+                            status=JudgeCacheStatus(judge_row["cache_status"]),
+                        ),
+                        review=JudgeReviewMetadata(
+                            status=JudgeReviewStatus(judge_row["review_status"]),
+                            reasons=[
+                                reason
+                                for reason, applies in (
+                                    (
+                                        JudgeReviewReason.LOW_CONFIDENCE,
+                                        bool(judge_row["below_confidence_threshold"]),
+                                    ),
+                                    (
+                                        JudgeReviewReason.CRITICAL_FAILURE,
+                                        bool(judge_row["critical_priority_failure"]),
+                                    ),
+                                )
+                                if applies
+                            ],
                         ),
                     )
                     if judge_row is not None

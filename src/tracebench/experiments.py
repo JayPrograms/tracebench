@@ -20,25 +20,35 @@ from tracebench.experiment_models import (
     GateMetric,
     GateViolation,
     GenerationDetails,
+    JudgeCacheStatus,
     RunAggregate,
     RunRole,
 )
 from tracebench.experiment_storage import (
+    JudgeCacheEntry,
     fail_attempt,
     insert_attempt,
+    insert_judge_cache_entry,
     load_experiment_report,
+    load_judge_cache_entry,
     persist_completed_comparison,
     persist_completed_run,
     persist_judge_attempt,
+    persist_judge_cache_lookup,
     start_run,
 )
 from tracebench.judges import (
+    JUDGE_CACHE_KEY_VERSION,
+    JUDGE_RESPONSE_SCHEMA_VERSION,
     JudgeOutputError,
+    build_judge_cache_identity,
     build_judge_prompt,
     build_judge_retry_prompt,
     judge_request_id,
-    parse_judge_output,
+    materialize_judge_result,
     request_hash,
+    validate_cached_judge_output,
+    validated_judge_output,
 )
 from tracebench.models import EvalCase, EvaluationMode
 from tracebench.providers import ProviderError, ProviderRequest, build_prompt
@@ -297,6 +307,42 @@ def _judge_case(
     judge = prepared.judge
     if judge is None:
         raise ValueError("rubric case has no prepared judge")
+    judge_request = judge_request_id(role, case.eval_id)
+    cache_identity = build_judge_cache_identity(
+        case,
+        output,
+        prompt_version=judge.prompt_version,
+        prompt_hash=judge.prompt_hash,
+        retry_prompt_hash=judge.retry_prompt_hash,
+        provider_identity=judge.provider_identity_for(judge_request),
+    )
+    cache_entry = _lookup_and_record_judge_cache(
+        connection=connection,
+        run_id=run_id,
+        case=case,
+        cache_key=cache_identity.cache_key,
+    )
+    if cache_entry is not None:
+        cached_response = validate_cached_judge_output(
+            case,
+            cache_identity,
+            cache_key=cache_entry.cache_key,
+            key_version=cache_entry.key_version,
+            identity_json=cache_entry.identity_json,
+            response_schema_version=cache_entry.response_schema_version,
+            response_json=cache_entry.response_json,
+            response_hash=cache_entry.response_hash,
+            raw_output=cache_entry.raw_output,
+        )
+        return materialize_judge_result(
+            case,
+            cached_response,
+            evaluated_output=output,
+            confidence_threshold=judge.confidence_threshold,
+            attempt_count=0,
+            cache_hit=True,
+            cache_key=cache_identity.cache_key,
+        )
     previous_output: str | None = None
     previous_error: JudgeOutputError | None = None
     for attempt_number in (1, 2):
@@ -319,7 +365,7 @@ def _judge_case(
         try:
             response = judge.provider.generate(
                 ProviderRequest(
-                    request_id=judge_request_id(role, case.eval_id),
+                    request_id=judge_request,
                     prompt=prompt,
                     response_format="json",
                 )
@@ -330,13 +376,7 @@ def _judge_case(
             ) from error
         latency_ms = max(0.0, (perf_counter_ns() - started_at) / 1_000_000)
         try:
-            result = parse_judge_output(
-                case,
-                response.output,
-                evaluated_output=output,
-                confidence_threshold=judge.confidence_threshold,
-                attempt_count=attempt_number,
-            )
+            validated = validated_judge_output(case, response.output)
         except JudgeOutputError as error:
             with connection:
                 persist_judge_attempt(
@@ -374,8 +414,75 @@ def _judge_case(
                 provider_metadata=dict(response.metadata),
                 timestamp=datetime.now(UTC),
             )
-        return result
+        with connection:
+            insert_judge_cache_entry(
+                connection,
+                cache_key=cache_identity.cache_key,
+                key_version=JUDGE_CACHE_KEY_VERSION,
+                identity_json=cache_identity.identity_json,
+                response_schema_version=JUDGE_RESPONSE_SCHEMA_VERSION,
+                response_json=validated.response_json,
+                response_hash=validated.response_hash,
+                raw_output=validated.raw_output,
+                timestamp=datetime.now(UTC),
+            )
+        winning_entry = load_judge_cache_entry(
+            connection,
+            cache_identity.cache_key,
+        )
+        if winning_entry is None:
+            raise sqlite3.IntegrityError(
+                "judge cache insertion conflict has no winning cache entry"
+            )
+        validate_cached_judge_output(
+            case,
+            cache_identity,
+            cache_key=winning_entry.cache_key,
+            key_version=winning_entry.key_version,
+            identity_json=winning_entry.identity_json,
+            response_schema_version=winning_entry.response_schema_version,
+            response_json=winning_entry.response_json,
+            response_hash=winning_entry.response_hash,
+            raw_output=winning_entry.raw_output,
+        )
+        return materialize_judge_result(
+            case,
+            validated.response,
+            evaluated_output=output,
+            confidence_threshold=judge.confidence_threshold,
+            attempt_count=attempt_number,
+            cache_hit=False,
+            cache_key=cache_identity.cache_key,
+        )
     raise AssertionError("judge attempts exhausted without a result")
+
+
+def _lookup_and_record_judge_cache(
+    *,
+    connection: sqlite3.Connection,
+    run_id: str,
+    case: EvalCase,
+    cache_key: str,
+) -> JudgeCacheEntry | None:
+    """Atomically record a short cache lookup without spanning provider work."""
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        entry = load_judge_cache_entry(connection, cache_key)
+        persist_judge_cache_lookup(
+            connection,
+            run_id=run_id,
+            eval_id=case.eval_id,
+            cache_key=cache_key,
+            cache_status=(
+                JudgeCacheStatus.HIT if entry is not None else JudgeCacheStatus.MISS
+            ),
+            timestamp=datetime.now(UTC),
+        )
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+    return entry
 
 
 def _record_operational_failure(

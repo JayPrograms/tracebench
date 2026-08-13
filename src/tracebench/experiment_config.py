@@ -106,8 +106,21 @@ class PreparedJudge:
     provider: Provider
     prompt: str
     retry_prompt: str
+    prompt_version: str
+    prompt_hash: str
+    retry_prompt_hash: str
     confidence_threshold: float
+    cache_provider_identity: dict[str, JsonValue]
+    fixture_request_hashes: dict[str, str] | None
     snapshot: dict[str, JsonValue]
+
+    def provider_identity_for(self, request_id: str) -> dict[str, object]:
+        """Return only provider inputs that affect this judge generation."""
+        identity: dict[str, object] = dict(self.cache_provider_identity)
+        if self.fixture_request_hashes is not None:
+            identity["request_id"] = request_id
+            identity["response_sequence_hash"] = self.fixture_request_hashes[request_id]
+        return identity
 
 
 def prepare_experiment(
@@ -251,6 +264,15 @@ def prepare_experiment(
             except ProviderError as error:
                 raise ExperimentPreflightError(str(error)) from error
             judge_provider: Provider = FixtureProvider(judge_outputs)
+            fixture_request_hashes = {
+                request_id: hashlib.sha256(
+                    _encode_canonical(list(outputs)).encode("utf-8")
+                ).hexdigest()
+                for request_id, outputs in judge_outputs.items()
+            }
+            cache_provider_identity: dict[str, JsonValue] = {
+                "provider": "fixture",
+            }
             snapshot = {
                 "provider": "fixture",
                 "fixture_hash": hashlib.sha256(
@@ -281,13 +303,26 @@ def prepare_experiment(
                 **common_snapshot,
             }
             canonical_judge = dict(snapshot)
+            fixture_request_hashes = None
+            cache_provider_identity = {
+                "provider": "ollama",
+                "base_url": judge_config.base_url,
+                "model": judge_config.model,
+                "temperature": judge_config.temperature,
+                "seed": judge_config.seed,
+            }
         else:
             raise AssertionError("unreachable judge configuration")
         prepared_judge = PreparedJudge(
             provider=judge_provider,
             prompt=prompt,
             retry_prompt=retry_prompt,
+            prompt_version=judge_config.prompt_version,
+            prompt_hash=prompt_hash,
+            retry_prompt_hash=retry_prompt_hash,
             confidence_threshold=judge_config.confidence_threshold,
+            cache_provider_identity=cache_provider_identity,
+            fixture_request_hashes=fixture_request_hashes,
             snapshot=snapshot,
         )
 

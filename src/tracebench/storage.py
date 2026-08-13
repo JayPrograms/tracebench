@@ -256,6 +256,36 @@ CREATE TABLE IF NOT EXISTS experiment_judges (
 )
 """,
     """
+CREATE TABLE IF NOT EXISTS judge_result_cache (
+    cache_key TEXT PRIMARY KEY
+        CHECK (
+            length(cache_key) = 64
+            AND cache_key NOT GLOB '*[^0-9a-f]*'
+        ),
+    key_version INTEGER NOT NULL CHECK (key_version = 1),
+    identity_json TEXT NOT NULL
+        CHECK (
+            json_valid(identity_json)
+            AND json_type(identity_json) = 'object'
+        ),
+    response_schema_version INTEGER NOT NULL
+        CHECK (response_schema_version = 1),
+    response_json TEXT NOT NULL
+        CHECK (
+            json_valid(response_json)
+            AND json_type(response_json) = 'object'
+        ),
+    response_hash TEXT NOT NULL
+        CHECK (
+            length(response_hash) = 64
+            AND response_hash NOT GLOB '*[^0-9a-f]*'
+        ),
+    raw_output TEXT NOT NULL CHECK (length(raw_output) > 0),
+    created_at TEXT NOT NULL,
+    UNIQUE (key_version, identity_json)
+)
+""",
+    """
 CREATE TABLE IF NOT EXISTS experiment_case_results (
     run_id TEXT NOT NULL
         REFERENCES experiment_runs(run_id) ON DELETE CASCADE,
@@ -306,6 +336,30 @@ CREATE TABLE IF NOT EXISTS experiment_judge_attempts (
 )
 """,
     """
+CREATE TABLE IF NOT EXISTS experiment_judge_cache_lookups (
+    run_id TEXT NOT NULL
+        REFERENCES experiment_runs(run_id) ON DELETE CASCADE,
+    eval_id TEXT NOT NULL
+        REFERENCES eval_cases(eval_id) ON DELETE RESTRICT,
+    cache_key TEXT,
+    cache_status TEXT NOT NULL
+        CHECK (cache_status IN ('hit', 'miss', 'not_recorded')),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, eval_id),
+    CHECK (
+        (
+            cache_status = 'not_recorded'
+            AND cache_key IS NULL
+        )
+        OR (
+            cache_status IN ('hit', 'miss')
+            AND length(cache_key) = 64
+            AND cache_key NOT GLOB '*[^0-9a-f]*'
+        )
+    )
+)
+""",
+    """
 CREATE TABLE IF NOT EXISTS experiment_scorer_results (
     run_id TEXT NOT NULL,
     eval_id TEXT NOT NULL,
@@ -324,7 +378,7 @@ CREATE TABLE IF NOT EXISTS experiment_scorer_results (
 CREATE TABLE IF NOT EXISTS experiment_judge_results (
     run_id TEXT NOT NULL,
     eval_id TEXT NOT NULL,
-    final_attempt_number INTEGER NOT NULL CHECK (final_attempt_number IN (1, 2)),
+    final_attempt_number INTEGER CHECK (final_attempt_number IN (1, 2)),
     response_schema_version INTEGER NOT NULL CHECK (response_schema_version = 1),
     overall_score REAL NOT NULL CHECK (overall_score >= 0.0 AND overall_score <= 1.0),
     overall_passed INTEGER NOT NULL CHECK (overall_passed IN (0, 1)),
@@ -333,6 +387,13 @@ CREATE TABLE IF NOT EXISTS experiment_judge_results (
         CHECK (confidence_threshold >= 0.0 AND confidence_threshold <= 1.0),
     below_confidence_threshold INTEGER NOT NULL
         CHECK (below_confidence_threshold IN (0, 1)),
+    cache_hit INTEGER CHECK (cache_hit IN (0, 1)),
+    critical_priority_failure INTEGER NOT NULL
+        CHECK (critical_priority_failure IN (0, 1)),
+    review_status TEXT NOT NULL
+        CHECK (
+            review_status IN ('not_required', 'needs_review', 'reviewed')
+        ),
     PRIMARY KEY (run_id, eval_id),
     FOREIGN KEY (run_id, eval_id)
         REFERENCES experiment_case_results(run_id, eval_id) ON DELETE CASCADE,
@@ -342,6 +403,30 @@ CREATE TABLE IF NOT EXISTS experiment_judge_results (
         ) ON DELETE RESTRICT,
     CHECK (
         below_confidence_threshold = (confidence < confidence_threshold)
+    ),
+    CHECK (
+        (
+            cache_hit = 1
+            AND final_attempt_number IS NULL
+        )
+        OR (
+            (cache_hit = 0 OR cache_hit IS NULL)
+            AND final_attempt_number IN (1, 2)
+        )
+    ),
+    CHECK (
+        (
+            review_status = 'not_required'
+            AND below_confidence_threshold = 0
+            AND critical_priority_failure = 0
+        )
+        OR (
+            review_status IN ('needs_review', 'reviewed')
+            AND (
+                below_confidence_threshold = 1
+                OR critical_priority_failure = 1
+            )
+        )
     )
 )
 """,
@@ -474,6 +559,30 @@ END
     """,
 )
 
+CACHE_TRIGGER_STATEMENTS = (
+    """
+CREATE TRIGGER IF NOT EXISTS prevent_judge_cache_update
+BEFORE UPDATE ON judge_result_cache
+BEGIN
+    SELECT RAISE(ABORT, 'judge result cache entries are immutable');
+END
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS prevent_judge_cache_delete
+BEFORE DELETE ON judge_result_cache
+BEGIN
+    SELECT RAISE(ABORT, 'judge result cache entries are immutable');
+END
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS prevent_judge_cache_lookup_update
+BEFORE UPDATE ON experiment_judge_cache_lookups
+BEGIN
+    SELECT RAISE(ABORT, 'judge cache lookup records are immutable');
+END
+""",
+)
+
 _EXPERIMENT_RESULT_RELATION_VALIDATION = """
     SELECT CASE WHEN NOT EXISTS (
         SELECT 1
@@ -525,8 +634,38 @@ _JUDGE_ATTEMPT_RELATION_VALIDATION = """
     ) END;
 """
 
-_JUDGE_RESULT_RELATION_VALIDATION = """
+_JUDGE_CACHE_LOOKUP_RELATION_VALIDATION = """
     SELECT CASE WHEN NOT EXISTS (
+        SELECT 1
+        FROM experiment_runs AS run
+        JOIN experiments AS experiment
+            ON experiment.experiment_id = run.experiment_id
+        JOIN experiment_judges AS judge
+            ON judge.experiment_id = experiment.experiment_id
+        JOIN eval_cases AS eval_case
+            ON eval_case.eval_id = NEW.eval_id
+        WHERE run.run_id = NEW.run_id
+            AND eval_case.dataset_id = experiment.dataset_id
+            AND eval_case.evaluation_mode = 'rubric'
+    ) THEN RAISE(
+        ABORT,
+        'judge cache lookup case must be a rubric case in the attempt dataset'
+    ) END;
+    SELECT CASE WHEN (
+        NEW.cache_status = 'hit'
+        AND NOT EXISTS (
+            SELECT 1
+            FROM judge_result_cache AS cache
+            WHERE cache.cache_key = NEW.cache_key
+        )
+    ) THEN RAISE(
+        ABORT,
+        'judge cache hit must reference an existing cache entry'
+    ) END;
+"""
+
+_JUDGE_RESULT_RELATION_VALIDATION = """
+    SELECT CASE WHEN NEW.final_attempt_number IS NOT NULL AND NOT EXISTS (
         SELECT 1
         FROM experiment_judge_attempts AS attempt
         WHERE attempt.run_id = NEW.run_id
@@ -536,6 +675,57 @@ _JUDGE_RESULT_RELATION_VALIDATION = """
     ) THEN RAISE(
         ABORT,
         'judge result must reference a parsed final attempt'
+    ) END;
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1
+        FROM experiment_judge_cache_lookups AS lookup
+        WHERE lookup.run_id = NEW.run_id
+            AND lookup.eval_id = NEW.eval_id
+            AND (
+                (
+                    lookup.cache_status = 'hit'
+                    AND NEW.cache_hit = 1
+                    AND NEW.final_attempt_number IS NULL
+                    AND EXISTS (
+                        SELECT 1
+                        FROM judge_result_cache AS cache
+                        WHERE cache.cache_key = lookup.cache_key
+                    )
+                )
+                OR (
+                    lookup.cache_status = 'miss'
+                    AND NEW.cache_hit = 0
+                    AND NEW.final_attempt_number IS NOT NULL
+                    AND EXISTS (
+                        SELECT 1
+                        FROM judge_result_cache AS cache
+                        WHERE cache.cache_key = lookup.cache_key
+                    )
+                )
+                OR (
+                    lookup.cache_status = 'not_recorded'
+                    AND NEW.cache_hit IS NULL
+                    AND NEW.final_attempt_number IS NOT NULL
+                )
+            )
+    ) THEN RAISE(
+        ABORT,
+        'judge result cache metadata does not match its lookup'
+    ) END;
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1
+        FROM eval_cases AS eval_case
+        WHERE eval_case.eval_id = NEW.eval_id
+            AND NEW.critical_priority_failure = CASE
+                WHEN (
+                    eval_case.priority = 'critical'
+                    AND NEW.overall_passed = 0
+                ) THEN 1
+                ELSE 0
+            END
+    ) THEN RAISE(
+        ABORT,
+        'judge result critical-failure metadata is inconsistent'
     ) END;
 """
 
@@ -583,6 +773,20 @@ BEGIN
 END
 """,
     f"""
+CREATE TRIGGER IF NOT EXISTS validate_judge_cache_lookup_relation_insert
+BEFORE INSERT ON experiment_judge_cache_lookups
+BEGIN
+{_JUDGE_CACHE_LOOKUP_RELATION_VALIDATION}
+END
+""",
+    f"""
+CREATE TRIGGER IF NOT EXISTS validate_judge_cache_lookup_relation_update
+BEFORE UPDATE ON experiment_judge_cache_lookups
+BEGIN
+{_JUDGE_CACHE_LOOKUP_RELATION_VALIDATION}
+END
+""",
+    f"""
 CREATE TRIGGER IF NOT EXISTS validate_judge_result_relation_insert
 BEFORE INSERT ON experiment_judge_results
 BEGIN
@@ -625,6 +829,7 @@ def connect_database(database_path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(database_path)
     try:
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA recursive_triggers = ON")
         # Schema migrations may rebuild a referenced table. A new sqlite3
         # connection starts with foreign keys disabled, so keep them disabled
         # only for this transaction and verify all relationships before commit.
@@ -636,6 +841,7 @@ def connect_database(database_path: Path) -> sqlite3.Connection:
         _migrate_experiment_schema(connection)
         for statement in (
             *EVAL_CASE_TRIGGER_STATEMENTS,
+            *CACHE_TRIGGER_STATEMENTS,
             *EXPERIMENT_TRIGGER_STATEMENTS,
         ):
             connection.execute(statement)
@@ -1049,6 +1255,104 @@ def _migrate_experiment_schema(connection: sqlite3.Connection) -> None:
     if tables_to_rebuild:
         _rebuild_experiment_tables(connection, tables_to_rebuild)
 
+    judge_result_columns = {
+        str(row["name"])
+        for row in connection.execute(
+            "PRAGMA table_info(experiment_judge_results)"
+        ).fetchall()
+    }
+    if not {
+        "cache_hit",
+        "critical_priority_failure",
+        "review_status",
+    }.issubset(judge_result_columns):
+        _migrate_judge_result_metadata(connection)
+
+
+def _migrate_judge_result_metadata(connection: sqlite3.Connection) -> None:
+    """Add A3 cache provenance and review state without losing A2 results."""
+    for trigger_name in (
+        "validate_judge_cache_lookup_relation_insert",
+        "validate_judge_cache_lookup_relation_update",
+        "validate_judge_result_relation_insert",
+        "validate_judge_result_relation_update",
+    ):
+        connection.execute(f'DROP TRIGGER IF EXISTS "{trigger_name}"')
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO experiment_judge_cache_lookups (
+            run_id, eval_id, cache_key, cache_status, created_at
+        )
+        SELECT
+            result.run_id,
+            result.eval_id,
+            NULL,
+            'not_recorded',
+            COALESCE(attempt.created_at, case_result.created_at)
+        FROM experiment_judge_results AS result
+        JOIN experiment_case_results AS case_result
+            ON case_result.run_id = result.run_id
+            AND case_result.eval_id = result.eval_id
+        LEFT JOIN experiment_judge_attempts AS attempt
+            ON attempt.run_id = result.run_id
+            AND attempt.eval_id = result.eval_id
+            AND attempt.attempt_number = result.final_attempt_number
+        """
+    )
+    marker = "CREATE TABLE IF NOT EXISTS experiment_judge_results ("
+    current_statement = next(
+        statement for statement in SCHEMA_STATEMENTS if marker in statement
+    )
+    migration_statement = current_statement.replace(
+        marker,
+        "CREATE TABLE experiment_judge_results_a3 (",
+        1,
+    )
+    connection.execute("DROP TABLE IF EXISTS experiment_judge_results_a3")
+    connection.execute(migration_statement)
+    connection.execute(
+        """
+        INSERT INTO experiment_judge_results_a3 (
+            run_id, eval_id, final_attempt_number,
+            response_schema_version, overall_score, overall_passed,
+            confidence, confidence_threshold, below_confidence_threshold,
+            cache_hit, critical_priority_failure, review_status
+        )
+        SELECT
+            result.run_id,
+            result.eval_id,
+            result.final_attempt_number,
+            result.response_schema_version,
+            result.overall_score,
+            result.overall_passed,
+            result.confidence,
+            result.confidence_threshold,
+            result.below_confidence_threshold,
+            NULL,
+            CASE
+                WHEN eval_case.priority = 'critical'
+                    AND result.overall_passed = 0
+                THEN 1
+                ELSE 0
+            END,
+            CASE
+                WHEN result.below_confidence_threshold = 1
+                    OR (
+                        eval_case.priority = 'critical'
+                        AND result.overall_passed = 0
+                    )
+                THEN 'needs_review'
+                ELSE 'not_required'
+            END
+        FROM experiment_judge_results AS result
+        JOIN eval_cases AS eval_case ON eval_case.eval_id = result.eval_id
+        """
+    )
+    connection.execute("DROP TABLE experiment_judge_results")
+    connection.execute(
+        "ALTER TABLE experiment_judge_results_a3 RENAME TO experiment_judge_results"
+    )
+
 
 def _rebuild_experiment_tables(
     connection: sqlite3.Connection,
@@ -1062,6 +1366,8 @@ def _rebuild_experiment_tables(
         "validate_experiment_comparison_relation_update",
         "validate_judge_attempt_relation_insert",
         "validate_judge_attempt_relation_update",
+        "validate_judge_cache_lookup_relation_insert",
+        "validate_judge_cache_lookup_relation_update",
         "validate_judge_result_relation_insert",
         "validate_judge_result_relation_update",
     )
@@ -1110,6 +1416,12 @@ def _rebuild_experiment_runs(connection: sqlite3.Connection) -> None:
     )
     connection.execute("DROP TRIGGER IF EXISTS validate_judge_attempt_relation_insert")
     connection.execute("DROP TRIGGER IF EXISTS validate_judge_attempt_relation_update")
+    connection.execute(
+        "DROP TRIGGER IF EXISTS validate_judge_cache_lookup_relation_insert"
+    )
+    connection.execute(
+        "DROP TRIGGER IF EXISTS validate_judge_cache_lookup_relation_update"
+    )
     run_statement = next(
         (
             statement
