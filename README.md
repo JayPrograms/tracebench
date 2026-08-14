@@ -49,6 +49,34 @@ List stored traces in newest-first order:
 tracebench traces list
 ```
 
+## Reproducible trace clustering and named slices
+
+Create an immutable, version-named clustering run over the current trace snapshot:
+
+```powershell
+tracebench traces cluster --name support-slices-v1 --clusters 6
+```
+
+The default document is the stored prompt exactly as ingested. Add
+`--include-context` to use a fixed prompt/context format containing canonical
+context JSON, or `--svd-components N` to enable the optional dimensionality
+reduction step. TraceBench requires the configured SVD dimension to satisfy
+`1 <= N < min(trace count, TF-IDF feature count)`.
+
+List the resulting numeric slices and assign a human-readable label:
+
+```powershell
+tracebench slices list support-slices-v1
+tracebench slices rename support-slices-v1 0 refunds
+```
+
+Run names, configurations, source provenance, and trace assignments are immutable.
+Labels are editable metadata and are unique within a run after Unicode NFKC
+normalization and case folding. Clustering uses deterministic trace ordering and
+fixed random seeds. The configuration identity records exact TraceBench,
+scikit-learn, NumPy, and SciPy versions; assignment equivalence is not promised
+across dependency versions, platforms, or numerical runtimes.
+
 ## Versioned evaluation datasets
 
 Create an independent dataset version:

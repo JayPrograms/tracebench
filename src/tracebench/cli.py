@@ -11,6 +11,13 @@ from typing import Annotated, Any, Never
 import typer
 from pydantic import ValidationError
 
+from tracebench.clustering import (
+    ClusteringError,
+    ClusteringValidationError,
+    create_clustering_run,
+    list_slices,
+    rename_slice,
+)
 from tracebench.datasets import (
     DatasetAlreadyExistsError,
     DatasetError,
@@ -51,9 +58,11 @@ app = typer.Typer(
 traces_app = typer.Typer(help="Inspect stored traces.")
 dataset_app = typer.Typer(help="Manage versioned evaluation datasets.")
 experiment_app = typer.Typer(help="Run persisted baseline/candidate experiments.")
+slices_app = typer.Typer(help="Inspect and label persistent trace slices.")
 app.add_typer(traces_app, name="traces")
 app.add_typer(dataset_app, name="dataset")
 app.add_typer(experiment_app, name="experiment")
+app.add_typer(slices_app, name="slices")
 
 
 @app.callback()
@@ -109,6 +118,85 @@ def show_traces() -> None:
         return
 
     _print_trace_table(traces)
+
+
+@traces_app.command("cluster")
+def cluster_traces(
+    name: Annotated[str, typer.Option(help="Unique versioned clustering run name.")],
+    clusters: Annotated[int, typer.Option(help="Number of clusters.")],
+    include_context: Annotated[
+        bool, typer.Option(help="Append canonical trace context to each prompt.")
+    ] = False,
+    svd_components: Annotated[
+        int | None,
+        typer.Option(help="Enable Truncated SVD with this dimension count."),
+    ] = None,
+) -> None:
+    """Cluster the current deterministic trace snapshot."""
+    try:
+        result = create_clustering_run(
+            resolve_database_path(),
+            name=name,
+            clusters=clusters,
+            include_context=include_context,
+            svd_components=svd_components,
+        )
+    except ClusteringValidationError as error:
+        typer.echo(
+            f"Error: {error}; no clustering run was persisted",
+            err=True,
+        )
+        raise typer.Exit(code=2) from error
+    except (ClusteringError, OSError, sqlite3.Error, ValueError) as error:
+        _exit_clustering_error(error)
+
+    run = result.run
+    typer.echo(f"Created clustering run {run.name} ({run.clustering_run_id}).")
+    typer.echo(f"Configuration hash: {run.configuration_hash}")
+    typer.echo(f"Source manifest hash: {run.source_manifest_hash}")
+    typer.echo(f"Traces clustered: {run.trace_count}")
+    typer.echo(f"Clusters: {run.cluster_count}")
+    typer.echo(
+        "SVD components: "
+        + ("disabled" if run.svd_components is None else str(run.svd_components))
+    )
+
+
+@slices_app.command("list")
+def show_slices(
+    name: Annotated[str, typer.Argument(help="Named clustering run.")],
+) -> None:
+    """List numeric slices and their editable labels."""
+    try:
+        run, slices = list_slices(resolve_database_path(), name)
+    except (ClusteringError, OSError, sqlite3.Error, ValueError) as error:
+        _exit_clustering_error(error)
+    typer.echo(f"Clustering run: {run.name} ({run.clustering_run_id})")
+    _print_table(
+        ("CLUSTER", "LABEL", "TRACES"),
+        [
+            (
+                str(item.cluster_number),
+                "-" if item.label is None else item.label,
+                str(item.trace_count),
+            )
+            for item in slices
+        ],
+    )
+
+
+@slices_app.command("rename")
+def rename_slice_command(
+    name: Annotated[str, typer.Argument(help="Named clustering run.")],
+    cluster_number: Annotated[int, typer.Argument(help="Numeric cluster identifier.")],
+    label: Annotated[str, typer.Argument(help="Human-readable slice label.")],
+) -> None:
+    """Rename a numeric slice without changing its assignments."""
+    try:
+        rename_slice(resolve_database_path(), name, cluster_number, label)
+    except (ClusteringError, OSError, sqlite3.Error, ValueError) as error:
+        _exit_clustering_error(error)
+    typer.echo(f"Renamed slice {cluster_number} in {name.strip()} to {label.strip()}.")
 
 
 @dataset_app.command("create")
@@ -573,6 +661,11 @@ def _format_validation_error(error: ValidationError) -> str:
 
 
 def _exit_dataset_error(error: BaseException) -> Never:
+    typer.echo(f"Error: {error}", err=True)
+    raise typer.Exit(code=1) from error
+
+
+def _exit_clustering_error(error: BaseException) -> Never:
     typer.echo(f"Error: {error}", err=True)
     raise typer.Exit(code=1) from error
 

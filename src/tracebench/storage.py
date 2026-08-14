@@ -3,6 +3,7 @@
 import json
 import os
 import sqlite3
+from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -36,6 +37,72 @@ CREATE TABLE IF NOT EXISTS traces (
     """
 CREATE INDEX IF NOT EXISTS idx_traces_timestamp_trace_id
 ON traces (timestamp DESC, trace_id ASC)
+""",
+    f"""
+CREATE TABLE IF NOT EXISTS trace_clustering_runs (
+    clustering_run_id TEXT PRIMARY KEY
+        CHECK (clustering_run_id GLOB 'cluster_run_[0-9a-f]*'
+            AND clustering_run_id NOT GLOB 'cluster_run_*[^0-9a-f]*'
+            AND length(clustering_run_id) = 44),
+    name TEXT NOT NULL UNIQUE
+        CHECK (length(name) > 0 AND name = trim(name, {_SQLITE_PYTHON_WHITESPACE})),
+    schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+    configuration_hash TEXT NOT NULL
+        CHECK (length(configuration_hash) = 64
+            AND configuration_hash NOT GLOB '*[^0-9a-f]*'),
+    configuration_json TEXT NOT NULL
+        CHECK (json_valid(configuration_json)
+            AND json_type(configuration_json) = 'object'),
+    source_manifest_hash TEXT NOT NULL
+        CHECK (length(source_manifest_hash) = 64
+            AND source_manifest_hash NOT GLOB '*[^0-9a-f]*'),
+    trace_count INTEGER NOT NULL CHECK (trace_count > 0),
+    feature_count INTEGER NOT NULL CHECK (feature_count > 0),
+    cluster_count INTEGER NOT NULL CHECK (cluster_count > 0),
+    inertia REAL NOT NULL CHECK (inertia >= 0.0 AND inertia < 1.0e999),
+    created_at TEXT NOT NULL
+)
+""",
+    """
+CREATE TABLE IF NOT EXISTS trace_cluster_assignments (
+    clustering_run_id TEXT NOT NULL
+        REFERENCES trace_clustering_runs(clustering_run_id) ON DELETE RESTRICT,
+    trace_id TEXT NOT NULL REFERENCES traces(trace_id) ON DELETE RESTRICT,
+    document_index INTEGER NOT NULL CHECK (document_index >= 0),
+    source_timestamp TEXT NOT NULL,
+    source_trace_hash TEXT NOT NULL
+        CHECK (length(source_trace_hash) = 64
+            AND source_trace_hash NOT GLOB '*[^0-9a-f]*'),
+    document_hash TEXT NOT NULL
+        CHECK (length(document_hash) = 64
+            AND document_hash NOT GLOB '*[^0-9a-f]*'),
+    cluster_number INTEGER NOT NULL CHECK (cluster_number >= 0),
+    PRIMARY KEY (clustering_run_id, trace_id),
+    UNIQUE (clustering_run_id, document_index)
+)
+""",
+    """
+CREATE INDEX IF NOT EXISTS idx_trace_cluster_assignments_cluster
+ON trace_cluster_assignments (clustering_run_id, cluster_number, trace_id)
+""",
+    """
+CREATE TABLE IF NOT EXISTS trace_cluster_labels (
+    clustering_run_id TEXT NOT NULL
+        REFERENCES trace_clustering_runs(clustering_run_id) ON DELETE RESTRICT,
+    cluster_number INTEGER NOT NULL CHECK (cluster_number >= 0),
+    label TEXT,
+    label_key TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (clustering_run_id, cluster_number),
+    CHECK ((label IS NULL AND label_key IS NULL)
+        OR (length(label) > 0 AND length(label_key) > 0))
+)
+""",
+    """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trace_cluster_labels_key
+ON trace_cluster_labels (clustering_run_id, label_key)
+WHERE label_key IS NOT NULL
 """,
     f"""
 CREATE TABLE IF NOT EXISTS eval_datasets (
@@ -802,6 +869,95 @@ END
 """,
 )
 
+CLUSTERING_TRIGGER_STATEMENTS = (
+    """
+CREATE TRIGGER IF NOT EXISTS validate_trace_cluster_assignment_insert
+BEFORE INSERT ON trace_cluster_assignments
+BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM trace_clustering_runs AS run
+        WHERE run.clustering_run_id = NEW.clustering_run_id
+          AND NEW.cluster_number < run.cluster_count
+          AND NEW.document_index < run.trace_count
+    ) THEN RAISE(ABORT, 'assignment cluster number is outside its run') END;
+    SELECT CASE WHEN (
+        SELECT COUNT(*) FROM trace_cluster_assignments AS assignment
+        WHERE assignment.clustering_run_id = NEW.clustering_run_id
+    ) >= (
+        SELECT run.trace_count FROM trace_clustering_runs AS run
+        WHERE run.clustering_run_id = NEW.clustering_run_id
+    ) THEN RAISE(ABORT, 'cluster assignments are immutable') END;
+END
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS validate_trace_cluster_label_insert
+BEFORE INSERT ON trace_cluster_labels
+BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM trace_clustering_runs AS run
+        WHERE run.clustering_run_id = NEW.clustering_run_id
+          AND NEW.cluster_number < run.cluster_count
+    ) THEN RAISE(ABORT, 'label cluster number is outside its run') END;
+END
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS prevent_trace_clustering_run_update
+BEFORE UPDATE ON trace_clustering_runs
+BEGIN SELECT RAISE(ABORT, 'clustering runs are immutable'); END
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS prevent_trace_clustering_run_delete
+BEFORE DELETE ON trace_clustering_runs
+BEGIN SELECT RAISE(ABORT, 'clustering runs are immutable'); END
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS prevent_trace_cluster_assignment_update
+BEFORE UPDATE ON trace_cluster_assignments
+BEGIN SELECT RAISE(ABORT, 'cluster assignments are immutable'); END
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS prevent_trace_cluster_assignment_delete
+BEFORE DELETE ON trace_cluster_assignments
+BEGIN SELECT RAISE(ABORT, 'cluster assignments are immutable'); END
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS prevent_trace_cluster_label_delete
+BEFORE DELETE ON trace_cluster_labels
+BEGIN SELECT RAISE(ABORT, 'cluster label rows cannot be deleted'); END
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS validate_trace_cluster_label_update
+BEFORE UPDATE ON trace_cluster_labels
+BEGIN
+    SELECT CASE WHEN NEW.clustering_run_id != OLD.clustering_run_id
+        OR NEW.cluster_number != OLD.cluster_number
+        OR NEW.created_at != OLD.created_at
+    THEN RAISE(ABORT, 'cluster label identity is immutable') END;
+    SELECT CASE WHEN (NEW.label IS NULL) != (NEW.label_key IS NULL)
+    THEN RAISE(ABORT, 'cluster label and key must change atomically') END;
+    SELECT CASE WHEN
+        (
+            NEW.label IS NOT OLD.label
+            OR NEW.label_key IS NOT OLD.label_key
+        ) != (NEW.updated_at IS NOT OLD.updated_at)
+    THEN RAISE(ABORT, 'cluster label, key, and timestamp must change atomically') END;
+END
+""",
+)
+
+_CLUSTERING_TABLE_NAMES = (
+    "trace_clustering_runs",
+    "trace_cluster_assignments",
+    "trace_cluster_labels",
+)
+
+SchemaRows = tuple[tuple[object, ...], ...]
+ClusteringTableMetadata = tuple[SchemaRows, SchemaRows, SchemaRows]
+ClusteringSchemaSnapshot = tuple[
+    tuple[tuple[str, str, str, str | None], ...],
+    dict[str, ClusteringTableMetadata],
+]
+
 REQUIRED_EVAL_CASE_COLUMNS = {
     "source_timestamp",
     "source_task_type",
@@ -835,6 +991,7 @@ def connect_database(database_path: Path) -> sqlite3.Connection:
         # only for this transaction and verify all relationships before commit.
         connection.execute("PRAGMA foreign_keys = OFF")
         connection.execute("BEGIN")
+        _ensure_clustering_schema_compatible(connection)
         for statement in SCHEMA_STATEMENTS:
             connection.execute(statement)
         _ensure_eval_schema_compatible(connection)
@@ -843,6 +1000,7 @@ def connect_database(database_path: Path) -> sqlite3.Connection:
             *EVAL_CASE_TRIGGER_STATEMENTS,
             *CACHE_TRIGGER_STATEMENTS,
             *EXPERIMENT_TRIGGER_STATEMENTS,
+            *CLUSTERING_TRIGGER_STATEMENTS,
         ):
             connection.execute(statement)
         foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
@@ -865,6 +1023,106 @@ def connect_database(database_path: Path) -> sqlite3.Connection:
             pass
         raise
     return connection
+
+
+def _ensure_clustering_schema_compatible(connection: sqlite3.Connection) -> None:
+    """Reject every partial, extra, or incompatible pre-existing B1 object."""
+    actual_objects = _clustering_schema_objects(connection)
+    if not actual_objects:
+        return
+    if _clustering_schema_snapshot(connection) == _EXPECTED_CLUSTERING_SCHEMA:
+        return
+    raise sqlite3.DatabaseError(
+        "clustering schema is incomplete or incompatible; recreate the B1 "
+        "clustering objects"
+    )
+
+
+def _build_expected_clustering_schema() -> ClusteringSchemaSnapshot:
+    """Build the canonical structured B1 schema snapshot once at import time."""
+    with closing(sqlite3.connect(":memory:")) as reference:
+        reference.row_factory = sqlite3.Row
+        for statement in SCHEMA_STATEMENTS:
+            if any(name in statement for name in _CLUSTERING_TABLE_NAMES):
+                reference.execute(statement)
+        for statement in CLUSTERING_TRIGGER_STATEMENTS:
+            reference.execute(statement)
+        return _clustering_schema_snapshot(reference)
+
+
+def _clustering_schema_snapshot(
+    connection: sqlite3.Connection,
+) -> ClusteringSchemaSnapshot:
+    return (
+        _clustering_schema_objects(connection),
+        {
+            table_name: (
+                _pragma_rows(connection, "table_xinfo", table_name),
+                _pragma_rows(connection, "foreign_key_list", table_name),
+                _index_metadata(connection, table_name),
+            )
+            for table_name in _CLUSTERING_TABLE_NAMES
+        },
+    )
+
+
+def _clustering_schema_objects(
+    connection: sqlite3.Connection,
+) -> tuple[tuple[str, str, str, str | None], ...]:
+    """Return normalized definitions for all B1-owned schema objects."""
+    rows = connection.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master "
+        "WHERE tbl_name IN (?, ?, ?) OR name GLOB 'trace_cluster*' "
+        "ORDER BY type, name",
+        _CLUSTERING_TABLE_NAMES,
+    ).fetchall()
+    return tuple(
+        (
+            str(row["type"]),
+            str(row["name"]),
+            str(row["tbl_name"]),
+            _normalize_schema_sql(row["sql"]),
+        )
+        for row in rows
+    )
+
+
+def _normalize_schema_sql(value: object) -> str | None:
+    if value is None:
+        return None
+    return " ".join(str(value).split())
+
+
+def _pragma_rows(
+    connection: sqlite3.Connection, pragma: str, object_name: str
+) -> tuple[tuple[object, ...], ...]:
+    """Return complete ordered PRAGMA metadata for a trusted object name."""
+    return tuple(
+        tuple(row)
+        for row in connection.execute(f'PRAGMA {pragma}("{object_name}")').fetchall()
+    )
+
+
+def _index_metadata(
+    connection: sqlite3.Connection, table_name: str
+) -> tuple[tuple[object, ...], ...]:
+    """Return index uniqueness, origin, partiality, and ordered column metadata."""
+    metadata: list[tuple[object, ...]] = []
+    for row in connection.execute(f'PRAGMA index_list("{table_name}")').fetchall():
+        index_name = str(row[1])
+        metadata.append(
+            (
+                index_name,
+                int(row[2]),
+                str(row[3]),
+                int(row[4]),
+                _pragma_rows(connection, "index_xinfo", index_name),
+            )
+        )
+    return tuple(sorted(metadata, key=lambda item: str(item[0])))
+
+
+_EXPECTED_CLUSTERING_SCHEMA = _build_expected_clustering_schema()
 
 
 def timestamp_to_text(timestamp: datetime) -> str:
