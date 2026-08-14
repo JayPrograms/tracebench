@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import TextIO
 from uuid import UUID, uuid5
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from tracebench.clustering import build_document, canonical_trace_payload
 from tracebench.models import (
@@ -23,6 +23,8 @@ from tracebench.models import (
     ReviewStatus,
     ScorerConfig,
     SliceBuildSource,
+    SliceCaseDefinition,
+    SliceCaseFile,
     SliceCaseProvenance,
     Trace,
 )
@@ -268,14 +270,16 @@ def build_dataset_from_slices(
     version: str,
     clustering_run_name: str,
     size: int,
+    case_file: Path | None = None,
 ) -> DatasetBuildResult:
-    """Atomically build an exact-size balanced reference dataset from B1 slices."""
+    """Atomically build an exact-size balanced dataset from immutable B1 slices."""
     canonical_name, canonical_version = _canonical_dataset_identity(name, version)
     run_name = clustering_run_name.strip()
     if not run_name:
         raise DatasetBuildValidationError("clustering run name must not be blank")
     if isinstance(size, bool) or size < 1:
         raise DatasetBuildValidationError("dataset size must be at least 1")
+    case_definitions = load_slice_case_file(case_file) if case_file is not None else {}
 
     built_at = datetime.now(UTC)
     dataset = EvalDataset(
@@ -392,7 +396,12 @@ def build_dataset_from_slices(
                             {
                                 "algorithm": "balanced-preference-hash-v1",
                                 "cluster_number": cluster_number,
-                                "clustering_run_id": run["clustering_run_id"],
+                                "clustering_configuration_hash": run[
+                                    "configuration_hash"
+                                ],
+                                "clustering_source_manifest_hash": run[
+                                    "source_manifest_hash"
+                                ],
                                 "critical_priority_signal": critical_priority_signal,
                                 "document_hash": row["document_hash"],
                                 "preference_tier": preference_tier,
@@ -431,7 +440,6 @@ def build_dataset_from_slices(
                             "algorithm": "balanced-preference-hash-v1",
                             "cluster_number": cluster_number,
                             "clustering_configuration_hash": run["configuration_hash"],
-                            "clustering_run_id": run["clustering_run_id"],
                             "source_manifest_hash": run["source_manifest_hash"],
                         }
                     )
@@ -514,6 +522,28 @@ def build_dataset_from_slices(
                 slice_manifest=manifest,
                 built_at=built_at,
             )
+            selected_by_cluster = {
+                cluster_number: sorted(
+                    eligible[cluster_number],
+                    key=lambda item: (
+                        item.preference_tier,
+                        item.selection_key,
+                        item.trace.trace_id,
+                    ),
+                )[: quotas[cluster_number]]
+                for cluster_number in range(cluster_count)
+            }
+            selected_trace_ids = {
+                selected.trace.trace_id
+                for selected_items in selected_by_cluster.values()
+                for selected in selected_items
+            }
+            unselected_definitions = sorted(set(case_definitions) - selected_trace_ids)
+            if unselected_definitions:
+                raise DatasetBuildValidationError(
+                    "case file contains source traces not selected by sampling: "
+                    + ", ".join(unselected_definitions)
+                )
             if not insert_eval_dataset(connection, dataset):
                 raise DatasetAlreadyExistsError(
                     f"dataset '{canonical_name}:{canonical_version}' already exists"
@@ -521,17 +551,15 @@ def build_dataset_from_slices(
 
             built_cases: list[EvalCase] = []
             for cluster_number in range(cluster_count):
-                ranked = sorted(
-                    eligible[cluster_number],
-                    key=lambda item: (
-                        item.preference_tier,
-                        item.selection_key,
-                        item.trace.trace_id,
-                    ),
-                )
-                for rank, selected in enumerate(ranked[: quotas[cluster_number]]):
+                for rank, selected in enumerate(selected_by_cluster[cluster_number]):
                     assignment = selected.assignment
                     trace = selected.trace
+                    definition = case_definitions.get(trace.trace_id)
+                    mode = (
+                        EvaluationMode.REFERENCE
+                        if definition is None
+                        else definition.mode
+                    )
                     provenance = SliceCaseProvenance(
                         selector=f"cluster-{cluster_number}",
                         cluster_number=cluster_number,
@@ -569,16 +597,28 @@ def build_dataset_from_slices(
                         source_trace_id=trace.trace_id,
                         source_timestamp=trace.timestamp,
                         source_task_type=trace.task_type,
-                        source_response=trace.response,
+                        source_response=(
+                            trace.response if mode is EvaluationMode.REFERENCE else None
+                        ),
                         source_metadata=trace.metadata,
                         input=trace.prompt,
                         context=trace.context,
-                        evaluation_mode=EvaluationMode.REFERENCE,
-                        reference_answer=trace.response,
-                        rubric=[],
-                        scorers=[],
-                        priority=Priority.MEDIUM,
-                        review_status=ReviewStatus.DRAFT,
+                        evaluation_mode=mode,
+                        reference_answer=(
+                            trace.response if mode is EvaluationMode.REFERENCE else None
+                        ),
+                        rubric=[] if definition is None else definition.rubric,
+                        scorers=[] if definition is None else definition.scorers,
+                        priority=(
+                            Priority.MEDIUM
+                            if definition is None
+                            else definition.priority
+                        ),
+                        review_status=(
+                            ReviewStatus.DRAFT
+                            if definition is None
+                            else definition.review_status
+                        ),
                         created_at=built_at,
                         slice_provenance=provenance,
                     )
@@ -613,6 +653,42 @@ def build_dataset_from_slices(
         slice_source=source,
         slices=summaries,
     )
+
+
+def load_slice_case_file(path: Path) -> dict[str, SliceCaseDefinition]:
+    """Load strict schema-v1 case overrides without accepting duplicate JSON keys."""
+    try:
+        contents = path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError) as error:
+        raise DatasetBuildValidationError(
+            f"could not read case file {path}: {error}"
+        ) from error
+    try:
+        payload = json.loads(
+            contents,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_non_finite_constant,
+        )
+    except ValueError as error:
+        message = error.msg if isinstance(error, json.JSONDecodeError) else str(error)
+        raise DatasetBuildValidationError(
+            f"invalid case file {path}: malformed JSON: {message}"
+        ) from error
+    try:
+        case_file = SliceCaseFile.model_validate(payload)
+    except ValidationError as error:
+        messages = "; ".join(
+            f"{'.'.join(str(part) for part in detail['loc'])}: {detail['msg']}"
+            for detail in error.errors(
+                include_url=False,
+                include_context=False,
+                include_input=False,
+            )
+        )
+        raise DatasetBuildValidationError(
+            f"invalid case file {path}: {messages}"
+        ) from error
+    return {case.source_trace_id: case for case in case_file.cases}
 
 
 def _historical_selection_signals(
@@ -782,6 +858,19 @@ def _canonical_json(value: object) -> str:
         separators=(",", ":"),
         sort_keys=True,
     )
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    decoded: dict[str, object] = {}
+    for key, value in pairs:
+        if key in decoded:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        decoded[key] = value
+    return decoded
+
+
+def _reject_non_finite_constant(value: str) -> None:
+    raise ValueError(f"non-finite number {value} is not valid JSON")
 
 
 def _sha256(value: str) -> str:

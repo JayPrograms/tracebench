@@ -1,0 +1,52 @@
+schema_version: 1
+name: northstar-support-ollama
+dataset: northstar-support-eval:1.0
+baseline:
+  provider: ollama
+  base_url: http://localhost:11434
+  model: llama3.2:3b
+  prompt_version: northstar-support-v1
+  system_prompt_file: prompts/baseline-v1.txt
+  temperature: 0
+  timeout_seconds: 120
+  seed: 42
+candidate:
+  provider: ollama
+  base_url: http://localhost:11434
+  model: llama3.2:3b
+  prompt_version: northstar-support-v2
+  system_prompt_file: prompts/candidate-v2.txt
+  temperature: 0
+  timeout_seconds: 120
+  seed: 42
+judge:
+  provider: ollama
+  base_url: http://localhost:11434
+  model: llama3.2:3b
+  prompt_version: rubric-v1
+  prompt_file: ../../prompts/judges/rubric-v1.txt
+  retry_prompt_file: ../../prompts/judges/rubric-retry-v1.txt
+  temperature: 0
+  timeout_seconds: 120
+  seed: 42
+  confidence_threshold: 0.7
+gate:
+  max_score_drop: 0.02
+  max_new_failures: 2
+  by_mode:
+    reference:
+      max_score_drop: 0.0
+      max_new_failures: 0
+    deterministic:
+      max_score_drop: 0.0
+      max_new_failures: 0
+    rubric:
+      max_score_drop: 0.05
+      max_new_failures: 1
+  by_slice:
+    refund-policy:
+      max_score_drop: 0.0
+      max_new_failures: 0
+    account-security:
+      max_score_drop: 0.0
+      max_new_failures: 0

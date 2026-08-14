@@ -100,11 +100,41 @@ insufficient eligible traces fail without creating a dataset. Generated cases
 are reference-mode, medium-priority drafts whose exact source responses are
 snapshotted as reference answers. No LLM participates in sampling.
 
+Add an optional strict schema-version-`1` JSON case file to override selected
+traces as deterministic, reference, or rubric cases before the dataset is sealed:
+
+```powershell
+tracebench dataset build `
+  --name support-eval `
+  --version 0.2 `
+  --from-slices support-slices-v1 `
+  --size 30 `
+  --case-file demos/customer-support/cases.json
+```
+
+Case-file entries may refer only to traces chosen by deterministic sampling.
+Selected traces omitted from the file remain reference cases. Invalid JSON,
+duplicate keys or trace definitions, unsupported schema versions, mode-invalid
+configuration, and unselected trace overrides fail atomically. Deterministic and
+rubric cases omit source responses and reference answers.
+
 Numeric selectors such as `cluster-0` are authoritative. Labels are optional and
 are snapshotted when the dataset is built, so later `slices rename` operations do
 not change existing datasets, exports, experiment reports, or gate resolution.
 Slice-built datasets are sealed and cannot receive later `dataset add-trace`
 promotions.
+
+Sampling rank and allocation identities use the immutable clustering
+configuration and source-manifest hashes rather than the random clustering-run
+identifier. Independent runs over the same trace snapshot therefore select the
+same cases while retaining distinct run provenance.
+
+## Customer-support product demo
+
+The [Northstar Shop demo](demos/customer-support/README.md) provides 35 traces,
+seven named slices, a mixed-mode 21-case dataset, deterministic baseline,
+candidate, and judge fixtures, an intentional failed release gate, judge-cache
+reuse, and an optional Ollama-compatible configuration.
 
 Create an independent dataset version:
 

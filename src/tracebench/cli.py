@@ -238,8 +238,19 @@ def build_eval_dataset(
         typer.Option("--from-slices", help="Immutable clustering run name."),
     ],
     size: Annotated[int, typer.Option(min=1, help="Exact number of evaluation cases.")],
+    case_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--case-file",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            help="Optional strict schema-v1 JSON overrides for selected cases.",
+        ),
+    ] = None,
 ) -> None:
-    """Build an exact-size balanced reference dataset from numeric slices."""
+    """Build an exact-size balanced dataset from numeric slices."""
     try:
         result = build_dataset_from_slices(
             resolve_database_path(),
@@ -247,6 +258,7 @@ def build_eval_dataset(
             version=version,
             clustering_run_name=from_slices,
             size=size,
+            case_file=case_file,
         )
     except DatasetBuildValidationError as error:
         typer.echo(f"Error: {error}; no dataset was persisted", err=True)

@@ -2,7 +2,7 @@
 
 import json
 from enum import StrEnum
-from typing import Any, Literal, Self
+from typing import Annotated, Any, Literal, Self
 
 from pydantic import (
     AwareDatetime,
@@ -86,6 +86,76 @@ class ScorerConfig(BaseModel):
         """Require scorer configuration to contain valid finite JSON."""
         _validate_json_value(value)
         return value
+
+
+class SliceCaseDefinition(BaseModel):
+    """One mode override for a trace selected by slice sampling."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_trace_id: str
+    mode: EvaluationMode
+    rubric: list[str] = Field(default_factory=list)
+    scorers: list[ScorerConfig] = Field(default_factory=list)
+    priority: Priority = Priority.MEDIUM
+    review_status: ReviewStatus = ReviewStatus.DRAFT
+
+    @field_validator("source_trace_id")
+    @classmethod
+    def reject_blank_source_trace_id(cls, value: str) -> str:
+        """Reject a blank source-trace selector."""
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("must not be blank")
+        return normalized
+
+    @field_validator("rubric")
+    @classmethod
+    def normalize_case_file_rubric(cls, value: list[str]) -> list[str]:
+        """Normalize criteria and reject blanks or duplicates."""
+        normalized = [criterion.strip() for criterion in value]
+        if any(not criterion for criterion in normalized):
+            raise ValueError("criteria must not be blank")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("criteria must not contain duplicates")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_mode_configuration(self) -> Self:
+        """Require exactly the configuration supported by the selected mode."""
+        if self.mode is EvaluationMode.DETERMINISTIC:
+            if not self.scorers:
+                raise ValueError("deterministic mode requires at least one scorer")
+            if self.rubric:
+                raise ValueError("deterministic mode forbids rubric criteria")
+        elif self.mode is EvaluationMode.REFERENCE:
+            if self.scorers:
+                raise ValueError("reference mode forbids deterministic scorers")
+            if self.rubric:
+                raise ValueError("reference mode forbids rubric criteria")
+        else:
+            if not self.rubric:
+                raise ValueError("rubric mode requires at least one rubric criterion")
+            if self.scorers:
+                raise ValueError("rubric mode forbids deterministic scorers")
+        return self
+
+
+class SliceCaseFile(BaseModel):
+    """Strict versioned case overrides for a slice-built dataset."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1]
+    cases: Annotated[list[SliceCaseDefinition], Field(min_length=1)]
+
+    @model_validator(mode="after")
+    def require_unique_source_trace_ids(self) -> Self:
+        """Reject ambiguous repeated trace definitions."""
+        source_trace_ids = [case.source_trace_id for case in self.cases]
+        if len(set(source_trace_ids)) != len(source_trace_ids):
+            raise ValueError("cases must not contain duplicate source_trace_id values")
+        return self
 
 
 class EvalDataset(BaseModel):
