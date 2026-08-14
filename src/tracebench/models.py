@@ -9,7 +9,9 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    SerializerFunctionWrapHandler,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
@@ -117,6 +119,60 @@ class EvalDataset(BaseModel):
         return normalized
 
 
+class SliceBuildSource(BaseModel):
+    """Immutable dataset-level provenance for a slice-built dataset."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    clustering_run_id: str
+    clustering_run_name: str
+    clustering_schema_version: int
+    clustering_configuration_hash: str
+    clustering_source_manifest_hash: str
+    cluster_count: int
+    sampling_schema_version: int
+    sampling_algorithm: str
+    requested_size: int
+    sampled_size: int
+    eligible_trace_count: int
+    slice_manifest_hash: str
+    slice_manifest: list[dict[str, Any]]
+    built_at: AwareDatetime
+
+
+class SliceCaseProvenance(BaseModel):
+    """Clustering assignment and sampling snapshot for one evaluation case."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    selector: str
+    cluster_number: int
+    label_snapshot: str | None
+    label_key_snapshot: str | None
+    clustering_run_id: str
+    clustering_run_name: str
+    clustering_schema_version: int
+    clustering_configuration_hash: str
+    clustering_source_manifest_hash: str
+    cluster_count: int
+    source_trace_id: str
+    source_timestamp: AwareDatetime
+    source_trace_hash: str
+    document_index: int
+    document_hash: str
+    sampling_schema_version: int
+    sampling_algorithm: str
+    requested_size: int
+    sampled_size: int
+    eligible_trace_count: int
+    slice_availability: int
+    slice_quota: int
+    rank_within_slice: int
+    selection_key: str
+    allocation_key: str
+    slice_manifest_hash: str
+
+
 class EvalCase(BaseModel):
     """A stored trace promoted into an evaluation dataset."""
 
@@ -138,6 +194,7 @@ class EvalCase(BaseModel):
     priority: Priority = Priority.MEDIUM
     review_status: ReviewStatus = ReviewStatus.DRAFT
     created_at: AwareDatetime
+    slice_provenance: SliceCaseProvenance | None = None
 
     @field_validator(
         "eval_id",
@@ -208,6 +265,17 @@ class EvalCase(BaseModel):
             if self.scorers:
                 raise ValueError("rubric mode forbids deterministic scorers")
         return self
+
+    @model_serializer(mode="wrap")
+    def omit_absent_slice_provenance(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        serialized = handler(self)
+        if not isinstance(serialized, dict):
+            raise TypeError("evaluation case must serialize as an object")
+        if self.slice_provenance is None:
+            serialized.pop("slice_provenance", None)
+        return serialized
 
 
 def _validate_json_value(value: object) -> None:

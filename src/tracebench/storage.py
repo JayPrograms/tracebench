@@ -8,7 +8,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
-from tracebench.models import EvalCase, EvalDataset, ScorerConfig, Trace
+from tracebench.models import (
+    EvalCase,
+    EvalDataset,
+    ScorerConfig,
+    SliceBuildSource,
+    SliceCaseProvenance,
+    Trace,
+)
 
 DATABASE_PATH_ENV = "TRACEBENCH_DB_PATH"
 DEFAULT_DATABASE_PATH = Path(".tracebench") / "tracebench.sqlite3"
@@ -186,6 +193,98 @@ CREATE TABLE IF NOT EXISTS eval_cases (
 CREATE INDEX IF NOT EXISTS idx_eval_cases_dataset_eval
 ON eval_cases (dataset_id, eval_id ASC)
     """,
+    """
+CREATE TABLE IF NOT EXISTS eval_dataset_slice_builds (
+    dataset_id TEXT PRIMARY KEY
+        REFERENCES eval_datasets(dataset_id) ON DELETE RESTRICT,
+    clustering_run_id TEXT NOT NULL
+        REFERENCES trace_clustering_runs(clustering_run_id) ON DELETE RESTRICT,
+    clustering_run_name TEXT NOT NULL CHECK (length(trim(clustering_run_name)) > 0),
+    clustering_schema_version INTEGER NOT NULL CHECK (clustering_schema_version = 1),
+    clustering_configuration_hash TEXT NOT NULL
+        CHECK (length(clustering_configuration_hash) = 64
+            AND clustering_configuration_hash NOT GLOB '*[^0-9a-f]*'),
+    clustering_source_manifest_hash TEXT NOT NULL
+        CHECK (length(clustering_source_manifest_hash) = 64
+            AND clustering_source_manifest_hash NOT GLOB '*[^0-9a-f]*'),
+    cluster_count INTEGER NOT NULL CHECK (cluster_count > 0),
+    sampling_schema_version INTEGER NOT NULL CHECK (sampling_schema_version = 1),
+    sampling_algorithm TEXT NOT NULL CHECK (sampling_algorithm = 'balanced-hash-v1'),
+    requested_size INTEGER NOT NULL CHECK (requested_size > 0),
+    sampled_size INTEGER NOT NULL CHECK (sampled_size = requested_size),
+    eligible_trace_count INTEGER NOT NULL
+        CHECK (eligible_trace_count >= sampled_size),
+    slice_manifest_json TEXT NOT NULL
+        CHECK (json_valid(slice_manifest_json)
+            AND json_type(slice_manifest_json) = 'array'),
+    slice_manifest_hash TEXT NOT NULL
+        CHECK (length(slice_manifest_hash) = 64
+            AND slice_manifest_hash NOT GLOB '*[^0-9a-f]*'),
+    built_at TEXT NOT NULL,
+    UNIQUE (dataset_id, clustering_run_id)
+)
+""",
+    """
+CREATE TABLE IF NOT EXISTS eval_case_slice_provenance (
+    eval_id TEXT PRIMARY KEY REFERENCES eval_cases(eval_id) ON DELETE RESTRICT,
+    dataset_id TEXT NOT NULL,
+    selector TEXT NOT NULL,
+    cluster_number INTEGER NOT NULL CHECK (cluster_number >= 0),
+    label_snapshot TEXT,
+    label_key_snapshot TEXT,
+    clustering_run_id TEXT NOT NULL,
+    clustering_run_name TEXT NOT NULL CHECK (length(trim(clustering_run_name)) > 0),
+    clustering_schema_version INTEGER NOT NULL CHECK (clustering_schema_version = 1),
+    clustering_configuration_hash TEXT NOT NULL
+        CHECK (length(clustering_configuration_hash) = 64
+            AND clustering_configuration_hash NOT GLOB '*[^0-9a-f]*'),
+    clustering_source_manifest_hash TEXT NOT NULL
+        CHECK (length(clustering_source_manifest_hash) = 64
+            AND clustering_source_manifest_hash NOT GLOB '*[^0-9a-f]*'),
+    cluster_count INTEGER NOT NULL CHECK (cluster_count > 0),
+    source_trace_id TEXT NOT NULL,
+    source_timestamp TEXT NOT NULL,
+    source_trace_hash TEXT NOT NULL
+        CHECK (length(source_trace_hash) = 64
+            AND source_trace_hash NOT GLOB '*[^0-9a-f]*'),
+    document_index INTEGER NOT NULL CHECK (document_index >= 0),
+    document_hash TEXT NOT NULL
+        CHECK (length(document_hash) = 64
+            AND document_hash NOT GLOB '*[^0-9a-f]*'),
+    sampling_schema_version INTEGER NOT NULL CHECK (sampling_schema_version = 1),
+    sampling_algorithm TEXT NOT NULL CHECK (sampling_algorithm = 'balanced-hash-v1'),
+    requested_size INTEGER NOT NULL CHECK (requested_size > 0),
+    sampled_size INTEGER NOT NULL CHECK (sampled_size = requested_size),
+    eligible_trace_count INTEGER NOT NULL CHECK (eligible_trace_count >= sampled_size),
+    slice_availability INTEGER NOT NULL CHECK (slice_availability > 0),
+    slice_quota INTEGER NOT NULL
+        CHECK (slice_quota > 0 AND slice_quota <= slice_availability),
+    rank_within_slice INTEGER NOT NULL
+        CHECK (rank_within_slice >= 0 AND rank_within_slice < slice_availability),
+    selection_key TEXT NOT NULL
+        CHECK (length(selection_key) = 64
+            AND selection_key NOT GLOB '*[^0-9a-f]*'),
+    allocation_key TEXT NOT NULL
+        CHECK (length(allocation_key) = 64
+            AND allocation_key NOT GLOB '*[^0-9a-f]*'),
+    slice_manifest_hash TEXT NOT NULL
+        CHECK (length(slice_manifest_hash) = 64
+            AND slice_manifest_hash NOT GLOB '*[^0-9a-f]*'),
+    CHECK (selector = 'cluster-' || CAST(cluster_number AS TEXT)),
+    CHECK ((label_snapshot IS NULL AND label_key_snapshot IS NULL)
+        OR (length(label_snapshot) > 0 AND length(label_key_snapshot) > 0)),
+    FOREIGN KEY (dataset_id, clustering_run_id)
+        REFERENCES eval_dataset_slice_builds(dataset_id, clustering_run_id)
+        ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY (clustering_run_id, source_trace_id)
+        REFERENCES trace_cluster_assignments(clustering_run_id, trace_id)
+        ON DELETE RESTRICT
+)
+""",
+    """
+CREATE INDEX IF NOT EXISTS idx_eval_case_slice_dataset_cluster
+ON eval_case_slice_provenance (dataset_id, cluster_number, eval_id)
+""",
     """
 CREATE TABLE IF NOT EXISTS experiments (
     experiment_id TEXT PRIMARY KEY CHECK (length(trim(experiment_id)) > 0),
@@ -556,17 +655,71 @@ CREATE TABLE IF NOT EXISTS experiment_comparison_aggregates (
 )
 """,
     """
+CREATE TABLE IF NOT EXISTS experiment_run_slice_aggregates (
+    run_id TEXT NOT NULL REFERENCES experiment_runs(run_id) ON DELETE CASCADE,
+    cluster_number INTEGER NOT NULL CHECK (cluster_number >= 0),
+    selector TEXT NOT NULL,
+    label_snapshot TEXT,
+    case_count INTEGER NOT NULL CHECK (case_count > 0),
+    passed_count INTEGER NOT NULL CHECK (passed_count >= 0),
+    failed_count INTEGER NOT NULL CHECK (failed_count >= 0),
+    score REAL NOT NULL CHECK (score >= 0.0 AND score <= 1.0),
+    pass_rate REAL NOT NULL CHECK (pass_rate >= 0.0 AND pass_rate <= 1.0),
+    PRIMARY KEY (run_id, cluster_number),
+    CHECK (selector = 'cluster-' || CAST(cluster_number AS TEXT)),
+    CHECK (passed_count + failed_count = case_count)
+)
+""",
+    """
+CREATE TABLE IF NOT EXISTS experiment_comparison_slice_aggregates (
+    experiment_id TEXT NOT NULL REFERENCES experiments(experiment_id) ON DELETE CASCADE,
+    cluster_number INTEGER NOT NULL CHECK (cluster_number >= 0),
+    selector TEXT NOT NULL,
+    label_snapshot TEXT,
+    case_count INTEGER NOT NULL CHECK (case_count > 0),
+    baseline_score REAL NOT NULL
+        CHECK (baseline_score >= 0.0 AND baseline_score <= 1.0),
+    candidate_score REAL NOT NULL
+        CHECK (candidate_score >= 0.0 AND candidate_score <= 1.0),
+    score_delta REAL NOT NULL CHECK (score_delta >= -1.0 AND score_delta <= 1.0),
+    baseline_pass_rate REAL NOT NULL
+        CHECK (baseline_pass_rate >= 0.0 AND baseline_pass_rate <= 1.0),
+    candidate_pass_rate REAL NOT NULL
+        CHECK (candidate_pass_rate >= 0.0 AND candidate_pass_rate <= 1.0),
+    newly_passed_count INTEGER NOT NULL CHECK (newly_passed_count >= 0),
+    newly_failed_count INTEGER NOT NULL CHECK (newly_failed_count >= 0),
+    PRIMARY KEY (experiment_id, cluster_number),
+    CHECK (selector = 'cluster-' || CAST(cluster_number AS TEXT)),
+    CHECK (newly_passed_count <= case_count),
+    CHECK (newly_failed_count <= case_count)
+)
+""",
+    """
 CREATE TABLE IF NOT EXISTS experiment_gate_violations (
     experiment_id TEXT NOT NULL
         REFERENCES experiments(experiment_id) ON DELETE CASCADE,
     violation_index INTEGER NOT NULL CHECK (violation_index >= 0),
-    scope TEXT NOT NULL
-        CHECK (scope IN ('global', 'deterministic', 'reference', 'rubric')),
+    scope TEXT NOT NULL CHECK (
+        scope IN ('global', 'deterministic', 'reference', 'rubric')
+        OR scope GLOB 'cluster-[0-9]*'
+    ),
+    scope_kind TEXT CHECK (scope_kind IN ('global', 'mode', 'slice')),
+    cluster_number INTEGER CHECK (cluster_number >= 0),
+    label_snapshot TEXT,
     metric TEXT NOT NULL CHECK (metric IN ('score_drop', 'new_failures')),
     actual REAL NOT NULL CHECK (actual >= 0.0),
     allowed REAL NOT NULL CHECK (allowed >= 0.0),
     message TEXT NOT NULL CHECK (length(trim(message)) > 0),
-    PRIMARY KEY (experiment_id, violation_index)
+    PRIMARY KEY (experiment_id, violation_index),
+    CHECK (
+        (scope_kind IS NULL AND cluster_number IS NULL AND label_snapshot IS NULL)
+        OR (scope_kind IN ('global', 'mode') AND cluster_number IS NULL)
+        OR (
+            scope_kind = 'slice'
+            AND cluster_number IS NOT NULL
+            AND scope = 'cluster-' || CAST(cluster_number AS TEXT)
+        )
+    )
 )
 """,
 )
@@ -624,6 +777,216 @@ BEGIN
 {_EVAL_CASE_JSON_VALIDATION}
 END
     """,
+)
+
+B2_TRIGGER_STATEMENTS = (
+    """
+CREATE TRIGGER IF NOT EXISTS prevent_slice_built_dataset_update
+BEFORE UPDATE ON eval_datasets
+WHEN EXISTS (
+    SELECT 1 FROM eval_dataset_slice_builds
+    WHERE dataset_id = OLD.dataset_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'slice-built datasets are sealed');
+END
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS prevent_slice_built_dataset_delete
+BEFORE DELETE ON eval_datasets
+WHEN EXISTS (
+    SELECT 1 FROM eval_dataset_slice_builds
+    WHERE dataset_id = OLD.dataset_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'slice-built datasets are sealed');
+END
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS prevent_case_insert_into_slice_build
+BEFORE INSERT ON eval_cases
+WHEN EXISTS (
+    SELECT 1 FROM eval_dataset_slice_builds
+    WHERE dataset_id = NEW.dataset_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'slice-built datasets are sealed');
+END
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS prevent_slice_built_case_update
+BEFORE UPDATE ON eval_cases
+WHEN EXISTS (
+    SELECT 1 FROM eval_dataset_slice_builds
+    WHERE dataset_id = OLD.dataset_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'slice-built datasets are sealed');
+END
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS prevent_slice_built_case_delete
+BEFORE DELETE ON eval_cases
+WHEN EXISTS (
+    SELECT 1 FROM eval_dataset_slice_builds
+    WHERE dataset_id = OLD.dataset_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'slice-built datasets are sealed');
+END
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS validate_case_slice_provenance_insert
+BEFORE INSERT ON eval_case_slice_provenance
+BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1
+        FROM eval_cases AS case_row
+        JOIN trace_clustering_runs AS run
+          ON run.clustering_run_id = NEW.clustering_run_id
+        JOIN trace_cluster_assignments AS assignment
+          ON assignment.clustering_run_id = NEW.clustering_run_id
+         AND assignment.trace_id = NEW.source_trace_id
+        JOIN trace_cluster_labels AS label
+          ON label.clustering_run_id = NEW.clustering_run_id
+         AND label.cluster_number = NEW.cluster_number
+        WHERE case_row.eval_id = NEW.eval_id
+          AND case_row.dataset_id = NEW.dataset_id
+          AND case_row.source_trace_id = NEW.source_trace_id
+          AND case_row.source_timestamp = NEW.source_timestamp
+          AND case_row.evaluation_mode = 'reference'
+          AND case_row.source_response IS NOT NULL
+          AND case_row.reference_answer = case_row.source_response
+          AND json_array_length(case_row.rubric_json) = 0
+          AND json_array_length(case_row.scorers_json) = 0
+          AND case_row.priority = 'medium'
+          AND case_row.review_status = 'draft'
+          AND run.name = NEW.clustering_run_name
+          AND run.schema_version = NEW.clustering_schema_version
+          AND run.configuration_hash = NEW.clustering_configuration_hash
+          AND run.source_manifest_hash = NEW.clustering_source_manifest_hash
+          AND run.cluster_count = NEW.cluster_count
+          AND assignment.cluster_number = NEW.cluster_number
+          AND assignment.source_timestamp = NEW.source_timestamp
+          AND assignment.source_trace_hash = NEW.source_trace_hash
+          AND assignment.document_index = NEW.document_index
+          AND assignment.document_hash = NEW.document_hash
+          AND label.label IS NEW.label_snapshot
+          AND label.label_key IS NEW.label_key_snapshot
+    ) THEN RAISE(ABORT, 'slice provenance does not match its immutable source') END;
+END
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS prevent_case_slice_provenance_update
+BEFORE UPDATE ON eval_case_slice_provenance
+BEGIN
+    SELECT RAISE(ABORT, 'case slice provenance is immutable');
+END
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS prevent_case_slice_provenance_delete
+BEFORE DELETE ON eval_case_slice_provenance
+BEGIN
+    SELECT RAISE(ABORT, 'case slice provenance is immutable');
+END
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS validate_dataset_slice_build_insert
+BEFORE INSERT ON eval_dataset_slice_builds
+BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM trace_clustering_runs AS run
+        WHERE run.clustering_run_id = NEW.clustering_run_id
+          AND run.name = NEW.clustering_run_name
+          AND run.schema_version = NEW.clustering_schema_version
+          AND run.configuration_hash = NEW.clustering_configuration_hash
+          AND run.source_manifest_hash = NEW.clustering_source_manifest_hash
+          AND run.cluster_count = NEW.cluster_count
+    ) THEN RAISE(ABORT, 'dataset slice build does not match its clustering run') END;
+    SELECT CASE WHEN (
+        SELECT COUNT(*) FROM eval_cases WHERE dataset_id = NEW.dataset_id
+    ) != NEW.sampled_size THEN RAISE(
+        ABORT, 'dataset slice build case count does not match sampled size'
+    ) END;
+    SELECT CASE WHEN (
+        SELECT COUNT(*) FROM eval_case_slice_provenance
+        WHERE dataset_id = NEW.dataset_id
+          AND clustering_run_id = NEW.clustering_run_id
+          AND slice_manifest_hash = NEW.slice_manifest_hash
+    ) != NEW.sampled_size THEN RAISE(
+        ABORT, 'dataset slice build provenance coverage is incomplete'
+    ) END;
+END
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS prevent_dataset_slice_build_update
+BEFORE UPDATE ON eval_dataset_slice_builds
+BEGIN
+    SELECT RAISE(ABORT, 'dataset slice builds are immutable');
+END
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS prevent_dataset_slice_build_delete
+BEFORE DELETE ON eval_dataset_slice_builds
+BEGIN
+    SELECT RAISE(ABORT, 'dataset slice builds are immutable');
+END
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS validate_comparison_slice_aggregate_insert
+BEFORE INSERT ON experiment_comparison_slice_aggregates
+BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1
+        FROM experiments AS experiment
+        JOIN eval_case_slice_provenance AS provenance
+          ON provenance.dataset_id = experiment.dataset_id
+         AND provenance.cluster_number = NEW.cluster_number
+        WHERE experiment.experiment_id = NEW.experiment_id
+          AND provenance.selector = NEW.selector
+          AND provenance.label_snapshot IS NEW.label_snapshot
+        GROUP BY experiment.experiment_id
+        HAVING COUNT(provenance.eval_id) = NEW.case_count
+    ) THEN RAISE(
+        ABORT, 'comparison slice aggregate does not match dataset membership'
+    ) END;
+END
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS validate_comparison_slice_aggregate_update
+BEFORE UPDATE ON experiment_comparison_slice_aggregates
+BEGIN
+    SELECT RAISE(ABORT, 'comparison slice aggregates are immutable');
+END
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS validate_gate_violation_scope_insert
+BEFORE INSERT ON experiment_gate_violations
+BEGIN
+    SELECT CASE WHEN NEW.scope_kind = 'global' AND NEW.scope != 'global'
+        THEN RAISE(ABORT, 'global gate violation has an invalid scope') END;
+    SELECT CASE WHEN NEW.scope_kind = 'mode'
+        AND NEW.scope NOT IN ('deterministic', 'reference', 'rubric')
+        THEN RAISE(ABORT, 'mode gate violation has an invalid scope') END;
+    SELECT CASE WHEN NEW.scope_kind = 'slice' AND NOT EXISTS (
+        SELECT 1
+        FROM experiments AS experiment
+        JOIN eval_case_slice_provenance AS provenance
+          ON provenance.dataset_id = experiment.dataset_id
+         AND provenance.cluster_number = NEW.cluster_number
+        WHERE experiment.experiment_id = NEW.experiment_id
+          AND provenance.selector = NEW.scope
+          AND provenance.label_snapshot IS NEW.label_snapshot
+    ) THEN RAISE(ABORT, 'slice gate violation is not represented by its dataset') END;
+END
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS validate_gate_violation_scope_update
+BEFORE UPDATE ON experiment_gate_violations
+BEGIN
+    SELECT RAISE(ABORT, 'gate violations are immutable');
+END
+""",
 )
 
 CACHE_TRIGGER_STATEMENTS = (
@@ -951,6 +1314,18 @@ _CLUSTERING_TABLE_NAMES = (
     "trace_cluster_labels",
 )
 
+_B2_TABLE_NAMES = (
+    "eval_dataset_slice_builds",
+    "eval_case_slice_provenance",
+    "experiment_run_slice_aggregates",
+    "experiment_comparison_slice_aggregates",
+)
+
+_B2_TRIGGER_NAMES = tuple(
+    statement.split("CREATE TRIGGER IF NOT EXISTS ", 1)[1].splitlines()[0]
+    for statement in B2_TRIGGER_STATEMENTS
+)
+
 SchemaRows = tuple[tuple[object, ...], ...]
 ClusteringTableMetadata = tuple[SchemaRows, SchemaRows, SchemaRows]
 ClusteringSchemaSnapshot = tuple[
@@ -992,17 +1367,21 @@ def connect_database(database_path: Path) -> sqlite3.Connection:
         connection.execute("PRAGMA foreign_keys = OFF")
         connection.execute("BEGIN")
         _ensure_clustering_schema_compatible(connection)
+        _ensure_b2_schema_absent_or_complete(connection)
         for statement in SCHEMA_STATEMENTS:
             connection.execute(statement)
         _ensure_eval_schema_compatible(connection)
         _migrate_experiment_schema(connection)
         for statement in (
             *EVAL_CASE_TRIGGER_STATEMENTS,
+            *B2_TRIGGER_STATEMENTS,
             *CACHE_TRIGGER_STATEMENTS,
             *EXPERIMENT_TRIGGER_STATEMENTS,
             *CLUSTERING_TRIGGER_STATEMENTS,
         ):
             connection.execute(statement)
+        _ensure_b2_schema_compatible(connection)
+        _ensure_b2_data_compatible(connection)
         foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
         if foreign_key_errors:
             first = foreign_key_errors[0]
@@ -1038,12 +1417,158 @@ def _ensure_clustering_schema_compatible(connection: sqlite3.Connection) -> None
     )
 
 
+def _ensure_b2_schema_absent_or_complete(connection: sqlite3.Connection) -> None:
+    """Reject interrupted or hand-authored partial B2 schemas before creation."""
+    migratable_trigger_names = {
+        "validate_gate_violation_scope_insert",
+        "validate_gate_violation_scope_update",
+    }
+    expected = {
+        *_B2_TABLE_NAMES,
+        *(name for name in _B2_TRIGGER_NAMES if name not in migratable_trigger_names),
+        "idx_eval_case_slice_dataset_cluster",
+    }
+    rows = connection.execute(
+        "SELECT name FROM sqlite_master WHERE name IN ("
+        + ",".join("?" for _ in expected)
+        + ")",
+        tuple(sorted(expected)),
+    ).fetchall()
+    actual = {str(row["name"]) for row in rows}
+    if actual and actual != expected:
+        raise sqlite3.DatabaseError(
+            "slice-aware B2 schema is partial or incompatible; recreate the B2 "
+            "schema objects"
+        )
+
+
+def _ensure_b2_schema_compatible(connection: sqlite3.Connection) -> None:
+    """Require exact B2-owned SQL plus its reconstructable model columns."""
+    expected_sql: dict[str, str | None] = {}
+    for statement in SCHEMA_STATEMENTS:
+        normalized = statement.lstrip()
+        for table_name in _B2_TABLE_NAMES:
+            marker = f"CREATE TABLE IF NOT EXISTS {table_name} "
+            if normalized.startswith(marker):
+                expected_sql[table_name] = _normalize_schema_sql(
+                    normalized.replace(
+                        f"CREATE TABLE IF NOT EXISTS {table_name}",
+                        f"CREATE TABLE {table_name}",
+                        1,
+                    )
+                )
+        if normalized.startswith(
+            "CREATE INDEX IF NOT EXISTS idx_eval_case_slice_dataset_cluster"
+        ):
+            expected_sql["idx_eval_case_slice_dataset_cluster"] = _normalize_schema_sql(
+                normalized.replace("CREATE INDEX IF NOT EXISTS", "CREATE INDEX", 1)
+            )
+    for statement in B2_TRIGGER_STATEMENTS:
+        normalized = statement.lstrip()
+        name = normalized.split("CREATE TRIGGER IF NOT EXISTS ", 1)[1].splitlines()[0]
+        expected_sql[name] = _normalize_schema_sql(
+            normalized.replace("CREATE TRIGGER IF NOT EXISTS", "CREATE TRIGGER", 1)
+        )
+    actual_rows = connection.execute(
+        "SELECT name, sql FROM sqlite_master WHERE name IN ("
+        + ",".join("?" for _ in expected_sql)
+        + ")",
+        tuple(sorted(expected_sql)),
+    ).fetchall()
+    actual_sql = {
+        str(row["name"]): _normalize_schema_sql(row["sql"]) for row in actual_rows
+    }
+    if actual_sql != expected_sql:
+        raise sqlite3.DatabaseError(
+            "slice-aware B2 schema is incomplete or incompatible; recreate the B2 "
+            "schema objects"
+        )
+
+    required: dict[str, set[str]] = {
+        "eval_dataset_slice_builds": {
+            "dataset_id",
+            "clustering_run_id",
+            "sampling_algorithm",
+            "slice_manifest_json",
+            "slice_manifest_hash",
+        },
+        "eval_case_slice_provenance": {
+            "eval_id",
+            "dataset_id",
+            "selector",
+            "cluster_number",
+            "source_trace_hash",
+            "selection_key",
+            "slice_manifest_hash",
+        },
+        "experiment_run_slice_aggregates": {
+            "run_id",
+            "cluster_number",
+            "score",
+            "pass_rate",
+        },
+        "experiment_comparison_slice_aggregates": {
+            "experiment_id",
+            "cluster_number",
+            "baseline_score",
+            "candidate_score",
+            "baseline_pass_rate",
+            "candidate_pass_rate",
+        },
+    }
+    for table_name, columns in required.items():
+        actual = {
+            str(row["name"])
+            for row in connection.execute(
+                f'PRAGMA table_info("{table_name}")'
+            ).fetchall()
+        }
+        if not columns.issubset(actual):
+            raise sqlite3.DatabaseError(
+                f"slice-aware B2 schema is incompatible: {table_name}"
+            )
+
+
+def _ensure_b2_data_compatible(connection: sqlite3.Connection) -> None:
+    """Reject persisted partial builds that cannot be treated as sealed."""
+    row = connection.execute(
+        """
+        SELECT build.dataset_id
+        FROM eval_dataset_slice_builds AS build
+        LEFT JOIN eval_cases AS case_row ON case_row.dataset_id = build.dataset_id
+        LEFT JOIN eval_case_slice_provenance AS provenance
+          ON provenance.eval_id = case_row.eval_id
+         AND provenance.dataset_id = build.dataset_id
+        GROUP BY build.dataset_id, build.sampled_size
+        HAVING COUNT(DISTINCT case_row.eval_id) != build.sampled_size
+            OR COUNT(DISTINCT provenance.eval_id) != build.sampled_size
+        LIMIT 1
+        """
+    ).fetchone()
+    if row is not None:
+        raise sqlite3.DatabaseError(
+            f"slice-built dataset '{row['dataset_id']}' is incomplete"
+        )
+
+
 def _build_expected_clustering_schema() -> ClusteringSchemaSnapshot:
     """Build the canonical structured B1 schema snapshot once at import time."""
     with closing(sqlite3.connect(":memory:")) as reference:
         reference.row_factory = sqlite3.Row
         for statement in SCHEMA_STATEMENTS:
-            if any(name in statement for name in _CLUSTERING_TABLE_NAMES):
+            normalized = statement.lstrip()
+            if any(
+                normalized.startswith(f"CREATE TABLE IF NOT EXISTS {name} ")
+                or normalized.startswith(f"CREATE INDEX IF NOT EXISTS {name}")
+                or normalized.startswith(f"CREATE UNIQUE INDEX IF NOT EXISTS {name}")
+                for name in (
+                    "trace_clustering_runs",
+                    "trace_cluster_assignments",
+                    "idx_trace_cluster_assignments_cluster",
+                    "trace_cluster_labels",
+                    "idx_trace_cluster_labels_key",
+                )
+            ):
                 reference.execute(statement)
         for statement in CLUSTERING_TRIGGER_STATEMENTS:
             reference.execute(statement)
@@ -1360,7 +1885,148 @@ def list_eval_cases(connection: sqlite3.Connection, dataset_id: str) -> list[Eva
         """,
         (dataset_id,),
     ).fetchall()
-    return [_case_from_row(row) for row in rows]
+    cases = [_case_from_row(row) for row in rows]
+    provenance_rows = connection.execute(
+        """
+        SELECT * FROM eval_case_slice_provenance
+        WHERE dataset_id = ?
+        ORDER BY eval_id ASC
+        """,
+        (dataset_id,),
+    ).fetchall()
+    provenance = {
+        str(row["eval_id"]): _slice_case_provenance_from_row(row)
+        for row in provenance_rows
+    }
+    return [
+        case.model_copy(update={"slice_provenance": provenance.get(case.eval_id)})
+        for case in cases
+    ]
+
+
+def insert_dataset_slice_build(
+    connection: sqlite3.Connection,
+    dataset_id: str,
+    source: SliceBuildSource,
+) -> None:
+    """Seal one fully populated slice-built dataset."""
+    connection.execute(
+        """
+        INSERT INTO eval_dataset_slice_builds (
+            dataset_id, clustering_run_id, clustering_run_name,
+            clustering_schema_version, clustering_configuration_hash,
+            clustering_source_manifest_hash, cluster_count,
+            sampling_schema_version, sampling_algorithm, requested_size,
+            sampled_size, eligible_trace_count, slice_manifest_json,
+            slice_manifest_hash, built_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            dataset_id,
+            source.clustering_run_id,
+            source.clustering_run_name,
+            source.clustering_schema_version,
+            source.clustering_configuration_hash,
+            source.clustering_source_manifest_hash,
+            source.cluster_count,
+            source.sampling_schema_version,
+            source.sampling_algorithm,
+            source.requested_size,
+            source.sampled_size,
+            source.eligible_trace_count,
+            _encode_json(source.slice_manifest),
+            source.slice_manifest_hash,
+            timestamp_to_text(source.built_at),
+        ),
+    )
+
+
+def insert_case_slice_provenance(
+    connection: sqlite3.Connection,
+    eval_id: str,
+    dataset_id: str,
+    provenance: SliceCaseProvenance,
+) -> None:
+    """Insert the immutable B1/sampling snapshot for one promoted case."""
+    connection.execute(
+        """
+        INSERT INTO eval_case_slice_provenance (
+            eval_id, dataset_id, selector, cluster_number,
+            label_snapshot, label_key_snapshot, clustering_run_id,
+            clustering_run_name, clustering_schema_version,
+            clustering_configuration_hash, clustering_source_manifest_hash,
+            cluster_count, source_trace_id, source_timestamp,
+            source_trace_hash, document_index, document_hash,
+            sampling_schema_version, sampling_algorithm, requested_size,
+            sampled_size, eligible_trace_count, slice_availability,
+            slice_quota, rank_within_slice, selection_key, allocation_key,
+            slice_manifest_hash
+        ) VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?, ?
+        )
+        """,
+        (
+            eval_id,
+            dataset_id,
+            provenance.selector,
+            provenance.cluster_number,
+            provenance.label_snapshot,
+            provenance.label_key_snapshot,
+            provenance.clustering_run_id,
+            provenance.clustering_run_name,
+            provenance.clustering_schema_version,
+            provenance.clustering_configuration_hash,
+            provenance.clustering_source_manifest_hash,
+            provenance.cluster_count,
+            provenance.source_trace_id,
+            timestamp_to_text(provenance.source_timestamp),
+            provenance.source_trace_hash,
+            provenance.document_index,
+            provenance.document_hash,
+            provenance.sampling_schema_version,
+            provenance.sampling_algorithm,
+            provenance.requested_size,
+            provenance.sampled_size,
+            provenance.eligible_trace_count,
+            provenance.slice_availability,
+            provenance.slice_quota,
+            provenance.rank_within_slice,
+            provenance.selection_key,
+            provenance.allocation_key,
+            provenance.slice_manifest_hash,
+        ),
+    )
+
+
+def get_dataset_slice_build(
+    connection: sqlite3.Connection, dataset_id: str
+) -> SliceBuildSource | None:
+    """Load a sealed dataset build snapshot, if this is a B2 dataset."""
+    row = connection.execute(
+        "SELECT * FROM eval_dataset_slice_builds WHERE dataset_id = ?",
+        (dataset_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return SliceBuildSource.model_validate(
+        {
+            "clustering_run_id": row["clustering_run_id"],
+            "clustering_run_name": row["clustering_run_name"],
+            "clustering_schema_version": row["clustering_schema_version"],
+            "clustering_configuration_hash": row["clustering_configuration_hash"],
+            "clustering_source_manifest_hash": row["clustering_source_manifest_hash"],
+            "cluster_count": row["cluster_count"],
+            "sampling_schema_version": row["sampling_schema_version"],
+            "sampling_algorithm": row["sampling_algorithm"],
+            "requested_size": row["requested_size"],
+            "sampled_size": row["sampled_size"],
+            "eligible_trace_count": row["eligible_trace_count"],
+            "slice_manifest_hash": row["slice_manifest_hash"],
+            "slice_manifest": _decode_list(row["slice_manifest_json"]),
+            "built_at": row["built_at"],
+        }
+    )
 
 
 def _encode_object(value: dict[str, Any]) -> str:
@@ -1425,6 +2091,42 @@ def _case_from_row(row: sqlite3.Row) -> EvalCase:
             "priority": row["priority"],
             "review_status": row["review_status"],
             "created_at": row["created_at"],
+        }
+    )
+
+
+def _slice_case_provenance_from_row(row: sqlite3.Row) -> SliceCaseProvenance:
+    return SliceCaseProvenance.model_validate(
+        {
+            key: row[key]
+            for key in (
+                "selector",
+                "cluster_number",
+                "label_snapshot",
+                "label_key_snapshot",
+                "clustering_run_id",
+                "clustering_run_name",
+                "clustering_schema_version",
+                "clustering_configuration_hash",
+                "clustering_source_manifest_hash",
+                "cluster_count",
+                "source_trace_id",
+                "source_timestamp",
+                "source_trace_hash",
+                "document_index",
+                "document_hash",
+                "sampling_schema_version",
+                "sampling_algorithm",
+                "requested_size",
+                "sampled_size",
+                "eligible_trace_count",
+                "slice_availability",
+                "slice_quota",
+                "rank_within_slice",
+                "selection_key",
+                "allocation_key",
+                "slice_manifest_hash",
+            )
         }
     )
 
@@ -1512,6 +2214,15 @@ def _migrate_experiment_schema(connection: sqlite3.Connection) -> None:
             tables_to_rebuild.append(table_name)
     if tables_to_rebuild:
         _rebuild_experiment_tables(connection, tables_to_rebuild)
+
+    gate_columns = {
+        str(row["name"])
+        for row in connection.execute(
+            "PRAGMA table_info(experiment_gate_violations)"
+        ).fetchall()
+    }
+    if not {"scope_kind", "cluster_number", "label_snapshot"}.issubset(gate_columns):
+        _rebuild_experiment_tables(connection, ["experiment_gate_violations"])
 
     judge_result_columns = {
         str(row["name"])

@@ -79,6 +79,30 @@ across dependency versions, platforms, or numerical runtimes.
 
 ## Versioned evaluation datasets
 
+Build an exact-size reference dataset directly from an immutable clustering run:
+
+```powershell
+tracebench dataset build `
+  --name support-eval `
+  --version 0.2 `
+  --from-slices support-slices-v1 `
+  --size 30
+```
+
+The builder considers only assigned traces with nonblank source responses. It
+allocates cases as evenly as possible across numeric clusters using deterministic
+round-robin quotas, then selects traces by stable SHA-256 ranks. The requested
+size is exact: insufficient eligible traces fail without creating a dataset.
+Generated cases are reference-mode, medium-priority drafts whose exact source
+responses are snapshotted as reference answers. No LLM, trace metadata priority,
+or prior experiment result participates in sampling.
+
+Numeric selectors such as `cluster-0` are authoritative. Labels are optional and
+are snapshotted when the dataset is built, so later `slices rename` operations do
+not change existing datasets, exports, experiment reports, or gate resolution.
+Slice-built datasets are sealed and cannot receive later `dataset add-trace`
+promotions.
+
 Create an independent dataset version:
 
 ```powershell
@@ -251,6 +275,30 @@ The YAML gate defaults to zero allowed global score drop and zero newly failed
 cases. Optional `by_mode` entries may override either limit and inherit the other
 global value. An override must name a supported mode present in the dataset.
 Absent modes are omitted from results rather than represented with zero or `NaN`.
+
+Slice-built datasets also support strict label or numeric-selector overrides:
+
+```yaml
+gate:
+  max_score_drop: 0.03
+  max_new_failures: 1
+  by_slice:
+    refunds:
+      max_score_drop: 0.0
+      max_new_failures: 0
+```
+
+Each configured slice inherits omitted limits from the global gate. Missing,
+ambiguous, duplicate, or unrepresented selectors fail preflight without creating
+an experiment attempt. Unlisted slices are still aggregated and reported but do
+not receive an independent slice gate. Gate comparisons use unrounded values and
+pass at exact threshold equality.
+
+Completed experiments on slice-built datasets emit machine-readable report schema
+version `2`, including `dataset.slice_source`, per-run `by_slice` aggregates, and
+comparison `by_slice` transitions. Experiments on ordinary datasets continue to
+emit the unchanged schema-version-`1` shape. Human reports add a numeric-order
+slice table only for slice-aware experiments.
 
 Every successful preflight creates a new experiment attempt. Names are reusable
 labels, so rerunning the same name never overwrites or resumes an earlier attempt.

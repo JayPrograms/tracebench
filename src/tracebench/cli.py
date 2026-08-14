@@ -20,10 +20,12 @@ from tracebench.clustering import (
 )
 from tracebench.datasets import (
     DatasetAlreadyExistsError,
+    DatasetBuildValidationError,
     DatasetError,
+    build_dataset_from_slices,
     create_dataset,
     export_dataset,
-    get_dataset_and_cases,
+    get_dataset_details,
     get_datasets,
     promote_trace,
 )
@@ -227,6 +229,59 @@ def create_eval_dataset(
     )
 
 
+@dataset_app.command("build")
+def build_eval_dataset(
+    name: Annotated[str, typer.Option(help="Dataset name.")],
+    version: Annotated[str, typer.Option(help="Dataset version.")],
+    from_slices: Annotated[
+        str,
+        typer.Option("--from-slices", help="Immutable clustering run name."),
+    ],
+    size: Annotated[int, typer.Option(min=1, help="Exact number of evaluation cases.")],
+) -> None:
+    """Build an exact-size balanced reference dataset from numeric slices."""
+    try:
+        result = build_dataset_from_slices(
+            resolve_database_path(),
+            name=name,
+            version=version,
+            clustering_run_name=from_slices,
+            size=size,
+        )
+    except DatasetBuildValidationError as error:
+        typer.echo(f"Error: {error}; no dataset was persisted", err=True)
+        raise typer.Exit(code=2) from error
+    except (DatasetError, OSError, sqlite3.Error, ValueError) as error:
+        _exit_dataset_error(error)
+
+    dataset = result.dataset
+    source = result.slice_source
+    typer.echo(
+        f"Created dataset {dataset.name}:{dataset.version} ({dataset.dataset_id})."
+    )
+    typer.echo(
+        f"Source clustering run: {source.clustering_run_name} "
+        f"({source.clustering_run_id})"
+    )
+    typer.echo(f"Sampling algorithm: {source.sampling_algorithm}")
+    typer.echo(f"Requested size: {source.requested_size}")
+    typer.echo(f"Eligible traces: {source.eligible_trace_count}")
+    typer.echo(f"Cases created: {len(result.cases)}")
+    _print_table(
+        ("SLICE", "CLUSTER", "LABEL", "ELIGIBLE", "SELECTED"),
+        [
+            (
+                item.selector,
+                str(item.cluster_number),
+                "-" if item.label_snapshot is None else item.label_snapshot,
+                str(item.eligible_count),
+                str(item.selected_count),
+            )
+            for item in result.slices
+        ],
+    )
+
+
 @dataset_app.command("list")
 def show_eval_datasets() -> None:
     """List stored evaluation datasets."""
@@ -330,7 +385,9 @@ def show_eval_dataset(
 ) -> None:
     """Show dataset metadata and evaluation cases."""
     try:
-        dataset, cases = get_dataset_and_cases(resolve_database_path(), reference)
+        dataset, cases, slice_source = get_dataset_details(
+            resolve_database_path(), reference
+        )
     except (DatasetError, OSError, sqlite3.Error, ValueError) as error:
         _exit_dataset_error(error)
 
@@ -339,6 +396,16 @@ def show_eval_dataset(
     typer.echo(f"Description: {dataset.description}")
     typer.echo(f"Created at: {timestamp_to_text(dataset.created_at)}")
     typer.echo(f"Cases: {len(cases)}")
+    if slice_source is not None:
+        typer.echo(
+            f"Slice source: {slice_source.clustering_run_name} "
+            f"({slice_source.clustering_run_id})"
+        )
+        typer.echo(
+            f"Sampling: {slice_source.sampling_algorithm}; "
+            f"requested={slice_source.requested_size}; "
+            f"eligible={slice_source.eligible_trace_count}"
+        )
     if cases:
         _print_eval_case_table(cases)
 
@@ -442,6 +509,37 @@ def _print_experiment_report(report: ExperimentReport) -> None:
     typer.echo(f"Candidate score: {candidate.global_.score:.6f}")
     typer.echo(f"Newly passed: {len(report.comparison.newly_passed)}")
     typer.echo(f"Newly failed: {len(report.comparison.newly_failed)}")
+    if report.comparison.by_slice:
+        _print_table(
+            (
+                "SLICE",
+                "LABEL",
+                "CASES",
+                "BASE_SCORE",
+                "CAND_SCORE",
+                "BASE_PASS_RATE",
+                "CAND_PASS_RATE",
+                "NEW_PASS",
+                "NEW_FAIL",
+            ),
+            [
+                (
+                    item.selector,
+                    "-" if item.label_snapshot is None else item.label_snapshot,
+                    str(item.case_count),
+                    f"{item.baseline_score:.6f}",
+                    f"{item.candidate_score:.6f}",
+                    f"{item.baseline_pass_rate:.6f}",
+                    f"{item.candidate_pass_rate:.6f}",
+                    str(item.newly_passed_count),
+                    str(item.newly_failed_count),
+                )
+                for item in sorted(
+                    report.comparison.by_slice.values(),
+                    key=lambda aggregate: aggregate.cluster_number,
+                )
+            ],
+        )
     rubric_results = [
         case
         for run in (baseline, candidate)
@@ -540,9 +638,11 @@ def _print_dataset_table(datasets: list[tuple[EvalDataset, int]]) -> None:
 
 
 def _print_eval_case_table(cases: list[EvalCase]) -> None:
+    slice_aware = any(case.slice_provenance is not None for case in cases)
     headers = (
         "EVAL_ID",
         "SOURCE_TRACE_ID",
+        *(("SLICE",) if slice_aware else ()),
         "MODE",
         "PRIORITY",
         "REVIEW_STATUS",
@@ -553,6 +653,15 @@ def _print_eval_case_table(cases: list[EvalCase]) -> None:
         (
             case.eval_id,
             case.source_trace_id,
+            *(
+                (
+                    case.slice_provenance.selector
+                    if case.slice_provenance is not None
+                    else "-",
+                )
+                if slice_aware
+                else ()
+            ),
             case.evaluation_mode.value,
             case.priority.value,
             case.review_status.value,

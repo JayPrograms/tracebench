@@ -18,7 +18,7 @@ from pydantic import (
     model_validator,
 )
 
-from tracebench.models import EvaluationMode
+from tracebench.models import EvaluationMode, SliceBuildSource
 
 
 class ExperimentStatus(StrEnum):
@@ -311,6 +311,39 @@ class ModeThresholdOverride(BaseModel):
         return self
 
 
+class SliceThresholdOverride(BaseModel):
+    """Strict optional threshold replacements for one represented slice."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_score_drop: Annotated[float | None, Field(ge=0.0, le=1.0)] = None
+    max_new_failures: Annotated[int | None, Field(ge=0)] = None
+
+    @field_validator("max_score_drop", mode="before")
+    @classmethod
+    def reject_non_numeric_score(cls, value: object) -> object:
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, (int, float))
+        ):
+            raise ValueError("must be a number, not a boolean or string")
+        return value
+
+    @field_validator("max_new_failures", mode="before")
+    @classmethod
+    def reject_non_integer_count(cls, value: object) -> object:
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int)
+        ):
+            raise ValueError("must be an integer, not a boolean or string")
+        return value
+
+    @model_validator(mode="after")
+    def require_an_override(self) -> Self:
+        if self.max_score_drop is None and self.max_new_failures is None:
+            raise ValueError("must override at least one threshold")
+        return self
+
+
 class RegressionGateConfig(BaseModel):
     """Global regression limits and optional mode-specific overrides."""
 
@@ -319,6 +352,16 @@ class RegressionGateConfig(BaseModel):
     max_score_drop: Annotated[float, Field(ge=0.0, le=1.0)] = 0.0
     max_new_failures: Annotated[int, Field(ge=0)] = 0
     by_mode: dict[EvaluationMode, ModeThresholdOverride] = Field(default_factory=dict)
+    by_slice: dict[str, SliceThresholdOverride] = Field(default_factory=dict)
+
+    @field_validator("by_slice", mode="before")
+    @classmethod
+    def require_string_slice_selectors(cls, value: object) -> object:
+        if isinstance(value, dict) and any(
+            not isinstance(key, str) or not key.strip() for key in value
+        ):
+            raise ValueError("slice selectors must be nonblank strings")
+        return value
 
 
 class ExperimentConfig(BaseModel):
@@ -549,6 +592,41 @@ class ComparisonAggregate(BaseModel):
     newly_failed_count: Annotated[int, Field(ge=0)]
 
 
+class SliceRunAggregate(BaseModel):
+    """One run's aggregate for a numeric dataset slice."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    selector: str
+    cluster_number: Annotated[int, Field(ge=0)]
+    label_snapshot: str | None
+    case_count: Annotated[int, Field(gt=0)]
+    passed_count: Annotated[int, Field(ge=0)]
+    failed_count: Annotated[int, Field(ge=0)]
+    score: Annotated[float, Field(ge=0.0, le=1.0)]
+    pass_rate: Annotated[float, Field(ge=0.0, le=1.0)]
+
+
+class SliceComparisonAggregate(BaseModel):
+    """Baseline/candidate comparison for a numeric dataset slice."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    selector: str
+    cluster_number: Annotated[int, Field(ge=0)]
+    label_snapshot: str | None
+    case_count: Annotated[int, Field(gt=0)]
+    baseline_score: Annotated[float, Field(ge=0.0, le=1.0)]
+    candidate_score: Annotated[float, Field(ge=0.0, le=1.0)]
+    score_delta: Annotated[float, Field(ge=-1.0, le=1.0)]
+    baseline_pass_rate: Annotated[float, Field(ge=0.0, le=1.0)]
+    candidate_pass_rate: Annotated[float, Field(ge=0.0, le=1.0)]
+    newly_passed_count: Annotated[int, Field(ge=0)]
+    newly_failed_count: Annotated[int, Field(ge=0)]
+    newly_passed: list[str]
+    newly_failed: list[str]
+
+
 class GateViolation(BaseModel):
     """One exceeded regression threshold."""
 
@@ -559,6 +637,22 @@ class GateViolation(BaseModel):
     actual: Annotated[float, Field(ge=0.0)]
     allowed: Annotated[float, Field(ge=0.0)]
     message: str
+    scope_kind: Literal["global", "mode", "slice"] | None = None
+    cluster_number: int | None = None
+    label_snapshot: str | None = None
+
+    @model_serializer(mode="wrap")
+    def omit_legacy_scope_metadata(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        serialized = handler(self)
+        if not isinstance(serialized, dict):
+            raise TypeError("gate violation must serialize as an object")
+        if self.scope_kind is None:
+            serialized.pop("scope_kind", None)
+            serialized.pop("cluster_number", None)
+            serialized.pop("label_snapshot", None)
+        return serialized
 
 
 class RunReport(BaseModel):
@@ -571,6 +665,18 @@ class RunReport(BaseModel):
     global_: RunAggregate = Field(alias="global", serialization_alias="global")
     by_mode: dict[str, RunAggregate]
     cases: list[CaseResult]
+    by_slice: dict[str, SliceRunAggregate] = Field(default_factory=dict)
+
+    @model_serializer(mode="wrap")
+    def omit_empty_slices(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        serialized = handler(self)
+        if not isinstance(serialized, dict):
+            raise TypeError("run report must serialize as an object")
+        if not self.by_slice:
+            serialized.pop("by_slice", None)
+        return serialized
 
 
 class ComparisonReport(BaseModel):
@@ -583,6 +689,18 @@ class ComparisonReport(BaseModel):
     cases: list[CaseComparison]
     newly_passed: list[str]
     newly_failed: list[str]
+    by_slice: dict[str, SliceComparisonAggregate] = Field(default_factory=dict)
+
+    @model_serializer(mode="wrap")
+    def omit_empty_slices(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        serialized = handler(self)
+        if not isinstance(serialized, dict):
+            raise TypeError("comparison report must serialize as an object")
+        if not self.by_slice:
+            serialized.pop("by_slice", None)
+        return serialized
 
 
 class GateReport(BaseModel):
@@ -602,6 +720,18 @@ class DatasetIdentity(BaseModel):
     dataset_id: str
     name: str
     version: str
+    slice_source: SliceBuildSource | None = None
+
+    @model_serializer(mode="wrap")
+    def omit_absent_slice_source(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        serialized = handler(self)
+        if not isinstance(serialized, dict):
+            raise TypeError("dataset identity must serialize as an object")
+        if self.slice_source is None:
+            serialized.pop("slice_source", None)
+        return serialized
 
 
 class ExperimentReport(BaseModel):
@@ -609,7 +739,7 @@ class ExperimentReport(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = 1
     experiment_id: str
     name: str
     configuration_hash: str

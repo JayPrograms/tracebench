@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -13,7 +14,8 @@ from pydantic import ValidationError
 from yaml.constructor import ConstructorError
 from yaml.nodes import MappingNode
 
-from tracebench.datasets import DatasetError, get_dataset_and_cases
+from tracebench.clustering import canonical_label
+from tracebench.datasets import DatasetError, get_dataset_details
 from tracebench.experiment_models import (
     EffectiveThresholds,
     ExperimentConfig,
@@ -28,7 +30,13 @@ from tracebench.judges import (
     MAX_MALFORMED_RETRIES,
     load_judge_fixture,
 )
-from tracebench.models import EvalCase, EvalDataset, EvaluationMode
+from tracebench.models import (
+    EvalCase,
+    EvalDataset,
+    EvaluationMode,
+    SliceBuildSource,
+    SliceCaseProvenance,
+)
 from tracebench.providers import (
     FixtureProvider,
     JsonValue,
@@ -97,6 +105,9 @@ class PreparedExperiment:
     configuration_hash: str
     configuration_json: str
     provider_snapshots: dict[RunRole, dict[str, JsonValue]]
+    slice_source: SliceBuildSource | None
+    slice_membership: dict[str, SliceCaseProvenance]
+    effective_slice_thresholds: dict[int, EffectiveThresholds]
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,7 +141,9 @@ def prepare_experiment(
     """Validate every input without persisting an experiment attempt."""
     config = load_experiment_config(config_path)
     try:
-        dataset, loaded_cases = get_dataset_and_cases(database_path, config.dataset)
+        dataset, loaded_cases, slice_source = get_dataset_details(
+            database_path, config.dataset
+        )
     except (DatasetError, OSError, ValueError) as error:
         raise ExperimentPreflightError(str(error)) from error
 
@@ -139,6 +152,10 @@ def prepare_experiment(
             f"dataset '{config.dataset}' contains no evaluation cases"
         )
     cases = tuple(sorted(loaded_cases, key=lambda case: case.eval_id))
+    slice_membership = _validate_slice_provenance(cases, slice_source)
+    effective_slice_thresholds = _effective_slice_thresholds(
+        config, slice_membership, slice_source
+    )
     rubric_cases = [
         case.eval_id for case in cases if case.evaluation_mode is EvaluationMode.RUBRIC
     ]
@@ -334,6 +351,8 @@ def prepare_experiment(
         canonical_providers=canonical_providers,
         canonical_judge=canonical_judge,
         effective_thresholds=effective_thresholds,
+        slice_source=slice_source,
+        effective_slice_thresholds=effective_slice_thresholds,
     )
     configuration_json = _encode_canonical(canonical)
     return PreparedExperiment(
@@ -349,6 +368,9 @@ def prepare_experiment(
         ).hexdigest(),
         configuration_json=configuration_json,
         provider_snapshots=provider_snapshots,
+        slice_source=slice_source,
+        slice_membership=slice_membership,
+        effective_slice_thresholds=effective_slice_thresholds,
     )
 
 
@@ -412,6 +434,104 @@ def _effective_thresholds(
     return effective
 
 
+def _validate_slice_provenance(
+    cases: tuple[EvalCase, ...],
+    source: SliceBuildSource | None,
+) -> dict[str, SliceCaseProvenance]:
+    provenance = {
+        case.eval_id: case.slice_provenance
+        for case in cases
+        if case.slice_provenance is not None
+    }
+    if source is None:
+        if provenance:
+            raise ExperimentPreflightError(
+                "dataset has case slice provenance without a sealed slice build"
+            )
+        return {}
+    if len(provenance) != len(cases):
+        raise ExperimentPreflightError(
+            "slice-built dataset has incomplete case provenance"
+        )
+    for eval_id, item in provenance.items():
+        if (
+            item.clustering_run_id != source.clustering_run_id
+            or item.clustering_configuration_hash
+            != source.clustering_configuration_hash
+            or item.clustering_source_manifest_hash
+            != source.clustering_source_manifest_hash
+            or item.slice_manifest_hash != source.slice_manifest_hash
+            or item.sampled_size != source.sampled_size
+        ):
+            raise ExperimentPreflightError(
+                f"evaluation case '{eval_id}' has inconsistent slice provenance"
+            )
+    return {eval_id: item for eval_id, item in provenance.items() if item is not None}
+
+
+def _effective_slice_thresholds(
+    config: ExperimentConfig,
+    membership: dict[str, SliceCaseProvenance],
+    source: SliceBuildSource | None,
+) -> dict[int, EffectiveThresholds]:
+    if not config.gate.by_slice:
+        return {}
+    if source is None or not membership:
+        raise ExperimentPreflightError(
+            "per-slice gate overrides require a slice-built dataset"
+        )
+    represented: dict[int, SliceCaseProvenance] = {}
+    for item in membership.values():
+        represented.setdefault(item.cluster_number, item)
+    label_candidates: dict[str, set[int]] = {}
+    for cluster_number, item in represented.items():
+        if item.label_key_snapshot is not None:
+            label_candidates.setdefault(item.label_key_snapshot, set()).add(
+                cluster_number
+            )
+    resolved: dict[int, EffectiveThresholds] = {}
+    global_thresholds = EffectiveThresholds(
+        max_score_drop=config.gate.max_score_drop,
+        max_new_failures=config.gate.max_new_failures,
+    )
+    for raw_selector, override in config.gate.by_slice.items():
+        selector = raw_selector.strip()
+        candidates: set[int] = set()
+        numeric = re.fullmatch(r"cluster-(0|[1-9][0-9]*)", selector)
+        if numeric is not None:
+            cluster_number = int(numeric.group(1))
+            if cluster_number in represented:
+                candidates.add(cluster_number)
+        _, key = canonical_label(selector)
+        candidates.update(label_candidates.get(key, set()))
+        if not candidates:
+            raise ExperimentPreflightError(
+                f"configured slice '{raw_selector}' is not represented in the dataset"
+            )
+        if len(candidates) > 1:
+            raise ExperimentPreflightError(
+                f"configured slice '{raw_selector}' is ambiguous"
+            )
+        cluster_number = next(iter(candidates))
+        if cluster_number in resolved:
+            raise ExperimentPreflightError(
+                f"multiple slice overrides resolve to cluster-{cluster_number}"
+            )
+        resolved[cluster_number] = EffectiveThresholds(
+            max_score_drop=(
+                global_thresholds.max_score_drop
+                if override.max_score_drop is None
+                else override.max_score_drop
+            ),
+            max_new_failures=(
+                global_thresholds.max_new_failures
+                if override.max_new_failures is None
+                else override.max_new_failures
+            ),
+        )
+    return dict(sorted(resolved.items()))
+
+
 def _canonical_configuration(
     *,
     config: ExperimentConfig,
@@ -420,6 +540,8 @@ def _canonical_configuration(
     canonical_providers: dict[RunRole, dict[str, JsonValue]],
     canonical_judge: dict[str, JsonValue] | None,
     effective_thresholds: dict[str, EffectiveThresholds],
+    slice_source: SliceBuildSource | None = None,
+    effective_slice_thresholds: dict[int, EffectiveThresholds] | None = None,
 ) -> dict[str, object]:
     case_definitions: list[dict[str, object]] = []
     for case in cases:
@@ -434,21 +556,37 @@ def _canonical_configuration(
         if case.evaluation_mode is EvaluationMode.RUBRIC:
             definition["rubric"] = list(case.rubric)
             definition["priority"] = case.priority.value
+        if case.slice_provenance is not None:
+            definition["slice"] = {
+                "selector": case.slice_provenance.selector,
+                "cluster_number": case.slice_provenance.cluster_number,
+                "slice_manifest_hash": case.slice_provenance.slice_manifest_hash,
+                "selection_key": case.slice_provenance.selection_key,
+            }
         case_definitions.append(definition)
+    dataset_payload: dict[str, object] = {
+        "dataset_id": dataset.dataset_id,
+        "name": dataset.name,
+        "version": dataset.version,
+        "cases": case_definitions,
+    }
+    if slice_source is not None:
+        dataset_payload["slice_source"] = slice_source.model_dump(mode="json")
+    gate_payload: dict[str, object] = {
+        scope: thresholds.model_dump(mode="json")
+        for scope, thresholds in sorted(effective_thresholds.items())
+    }
+    if effective_slice_thresholds:
+        gate_payload["by_slice"] = {
+            f"cluster-{cluster_number}": thresholds.model_dump(mode="json")
+            for cluster_number, thresholds in sorted(effective_slice_thresholds.items())
+        }
     canonical: dict[str, object] = {
         "schema_version": config.schema_version,
-        "dataset": {
-            "dataset_id": dataset.dataset_id,
-            "name": dataset.name,
-            "version": dataset.version,
-            "cases": case_definitions,
-        },
+        "dataset": dataset_payload,
         "baseline": canonical_providers[RunRole.BASELINE],
         "candidate": canonical_providers[RunRole.CANDIDATE],
-        "gate": {
-            scope: thresholds.model_dump(mode="json")
-            for scope, thresholds in sorted(effective_thresholds.items())
-        },
+        "gate": gate_payload,
     }
     if canonical_judge is not None:
         canonical["judge"] = canonical_judge

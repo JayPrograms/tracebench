@@ -29,9 +29,11 @@ from tracebench.experiment_models import (
     RunReport,
     RunRole,
     ScorerResult,
+    SliceComparisonAggregate,
+    SliceRunAggregate,
 )
 from tracebench.providers import JsonValue
-from tracebench.storage import timestamp_to_text
+from tracebench.storage import get_dataset_slice_build, timestamp_to_text
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,6 +294,7 @@ def persist_completed_run(
     results: list[CaseResult],
     generation_details: dict[str, GenerationDetails],
     aggregates: list[RunAggregate],
+    slice_aggregates: list[SliceRunAggregate],
     timestamp: datetime,
 ) -> None:
     """Atomically insert all normalized run rows and complete the run."""
@@ -384,6 +387,26 @@ def persist_completed_run(
                 aggregate.pass_rate,
             ),
         )
+    for slice_aggregate in slice_aggregates:
+        connection.execute(
+            """
+            INSERT INTO experiment_run_slice_aggregates (
+                run_id, cluster_number, selector, label_snapshot,
+                case_count, passed_count, failed_count, score, pass_rate
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                slice_aggregate.cluster_number,
+                slice_aggregate.selector,
+                slice_aggregate.label_snapshot,
+                slice_aggregate.case_count,
+                slice_aggregate.passed_count,
+                slice_aggregate.failed_count,
+                slice_aggregate.score,
+                slice_aggregate.pass_rate,
+            ),
+        )
     cursor = connection.execute(
         """
         UPDATE experiment_runs
@@ -402,6 +425,7 @@ def persist_completed_comparison(
     experiment_id: str,
     comparisons: list[CaseComparison],
     aggregates: list[ComparisonAggregate],
+    slice_aggregates: list[SliceComparisonAggregate],
     violations: list[GateViolation],
     verdict: ExperimentVerdict,
     timestamp: datetime,
@@ -448,18 +472,47 @@ def persist_completed_comparison(
                 aggregate.newly_failed_count,
             ),
         )
+    for slice_aggregate in slice_aggregates:
+        connection.execute(
+            """
+            INSERT INTO experiment_comparison_slice_aggregates (
+                experiment_id, cluster_number, selector, label_snapshot,
+                case_count, baseline_score, candidate_score, score_delta,
+                baseline_pass_rate, candidate_pass_rate,
+                newly_passed_count, newly_failed_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                experiment_id,
+                slice_aggregate.cluster_number,
+                slice_aggregate.selector,
+                slice_aggregate.label_snapshot,
+                slice_aggregate.case_count,
+                slice_aggregate.baseline_score,
+                slice_aggregate.candidate_score,
+                slice_aggregate.score_delta,
+                slice_aggregate.baseline_pass_rate,
+                slice_aggregate.candidate_pass_rate,
+                slice_aggregate.newly_passed_count,
+                slice_aggregate.newly_failed_count,
+            ),
+        )
     for violation_index, violation in enumerate(violations):
         connection.execute(
             """
             INSERT INTO experiment_gate_violations (
-                experiment_id, violation_index, scope, metric,
+                experiment_id, violation_index, scope, scope_kind,
+                cluster_number, label_snapshot, metric,
                 actual, allowed, message
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 experiment_id,
                 violation_index,
                 violation.scope,
+                violation.scope_kind,
+                violation.cluster_number,
+                violation.label_snapshot,
                 violation.metric.value,
                 violation.actual,
                 violation.allowed,
@@ -596,6 +649,60 @@ def load_experiment_report(
             for row in aggregate_rows
         }
         global_comparison = comparison_aggregates.pop("global")
+        membership_rows = connection.execute(
+            """
+            SELECT provenance.eval_id, provenance.cluster_number
+            FROM eval_case_slice_provenance AS provenance
+            JOIN experiments AS experiment
+              ON experiment.dataset_id = provenance.dataset_id
+            WHERE experiment.experiment_id = ?
+            """,
+            (experiment_id,),
+        ).fetchall()
+        membership = {
+            str(row["eval_id"]): int(row["cluster_number"]) for row in membership_rows
+        }
+        slice_rows = connection.execute(
+            """
+            SELECT * FROM experiment_comparison_slice_aggregates
+            WHERE experiment_id = ? ORDER BY cluster_number ASC
+            """,
+            (experiment_id,),
+        ).fetchall()
+        slice_aggregates: dict[str, SliceComparisonAggregate] = {}
+        for row in slice_rows:
+            cluster_number = int(row["cluster_number"])
+            items = [
+                item
+                for item in case_comparisons
+                if membership.get(item.eval_id) == cluster_number
+            ]
+            newly_passed = sorted(
+                item.eval_id
+                for item in items
+                if item.transition is ComparisonTransition.NEWLY_PASSED
+            )
+            newly_failed = sorted(
+                item.eval_id
+                for item in items
+                if item.transition is ComparisonTransition.NEWLY_FAILED
+            )
+            aggregate = SliceComparisonAggregate(
+                selector=row["selector"],
+                cluster_number=cluster_number,
+                label_snapshot=row["label_snapshot"],
+                case_count=row["case_count"],
+                baseline_score=row["baseline_score"],
+                candidate_score=row["candidate_score"],
+                score_delta=row["score_delta"],
+                baseline_pass_rate=row["baseline_pass_rate"],
+                candidate_pass_rate=row["candidate_pass_rate"],
+                newly_passed_count=row["newly_passed_count"],
+                newly_failed_count=row["newly_failed_count"],
+                newly_passed=newly_passed,
+                newly_failed=newly_failed,
+            )
+            slice_aggregates[aggregate.selector] = aggregate
         comparison = ComparisonReport.model_validate(
             {
                 "global": global_comparison,
@@ -611,11 +718,13 @@ def load_experiment_report(
                     for case in case_comparisons
                     if case.transition is ComparisonTransition.NEWLY_FAILED
                 ],
+                "by_slice": slice_aggregates,
             }
         )
         violation_rows = connection.execute(
             """
-            SELECT scope, metric, actual, allowed, message
+            SELECT scope, scope_kind, cluster_number, label_snapshot,
+                   metric, actual, allowed, message
             FROM experiment_gate_violations
             WHERE experiment_id = ?
             ORDER BY violation_index ASC
@@ -629,12 +738,17 @@ def load_experiment_report(
                 actual=row["actual"],
                 allowed=row["allowed"],
                 message=row["message"],
+                scope_kind=row["scope_kind"],
+                cluster_number=row["cluster_number"],
+                label_snapshot=row["label_snapshot"],
             )
             for row in violation_rows
         ]
         gate = GateReport(passed=not violations, violations=violations)
 
+    slice_source = get_dataset_slice_build(connection, attempt["dataset_id"])
     return ExperimentReport(
+        schema_version=2 if slice_source is not None else 1,
         experiment_id=attempt["experiment_id"],
         name=attempt["name"],
         configuration_hash=attempt["configuration_hash"],
@@ -642,6 +756,7 @@ def load_experiment_report(
             dataset_id=attempt["dataset_id"],
             name=attempt["dataset_name"],
             version=attempt["dataset_version"],
+            slice_source=slice_source,
         ),
         status=ExperimentStatus(attempt["status"]),
         verdict=(
@@ -782,6 +897,26 @@ def _load_run_report(
         row["scope"]: RunAggregate.model_validate(dict(row)) for row in aggregate_rows
     }
     global_aggregate = aggregates.pop("global")
+    slice_rows = connection.execute(
+        """
+        SELECT * FROM experiment_run_slice_aggregates
+        WHERE run_id = ? ORDER BY cluster_number ASC
+        """,
+        (run_id,),
+    ).fetchall()
+    slice_aggregates = {
+        str(row["selector"]): SliceRunAggregate(
+            selector=row["selector"],
+            cluster_number=row["cluster_number"],
+            label_snapshot=row["label_snapshot"],
+            case_count=row["case_count"],
+            passed_count=row["passed_count"],
+            failed_count=row["failed_count"],
+            score=row["score"],
+            pass_rate=row["pass_rate"],
+        )
+        for row in slice_rows
+    }
     return RunReport.model_validate(
         {
             "run_id": run_id,
@@ -789,6 +924,7 @@ def _load_run_report(
             "global": global_aggregate,
             "by_mode": aggregates,
             "cases": results,
+            "by_slice": slice_aggregates,
         }
     )
 

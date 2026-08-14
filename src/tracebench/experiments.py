@@ -23,6 +23,8 @@ from tracebench.experiment_models import (
     JudgeCacheStatus,
     RunAggregate,
     RunRole,
+    SliceComparisonAggregate,
+    SliceRunAggregate,
 )
 from tracebench.experiment_storage import (
     JudgeCacheEntry,
@@ -50,7 +52,7 @@ from tracebench.judges import (
     validate_cached_judge_output,
     validated_judge_output,
 )
-from tracebench.models import EvalCase, EvaluationMode
+from tracebench.models import EvalCase, EvaluationMode, SliceCaseProvenance
 from tracebench.providers import ProviderError, ProviderRequest, build_prompt
 from tracebench.scorers import score_case
 from tracebench.storage import connect_database
@@ -113,9 +115,17 @@ def execute_experiment(config_path: Path, database_path: Path) -> ExperimentRepo
                 completed_results[RunRole.BASELINE],
                 completed_results[RunRole.CANDIDATE],
             )
+            slice_comparison_aggregates = compare_run_slices(
+                completed_results[RunRole.BASELINE],
+                completed_results[RunRole.CANDIDATE],
+                prepared.slice_membership,
+            )
             violations = apply_regression_gate(
                 comparison_aggregates,
                 prepared.effective_thresholds,
+                slice_aggregates=slice_comparison_aggregates,
+                slice_thresholds=prepared.effective_slice_thresholds,
+                slice_aware=prepared.slice_source is not None,
             )
             verdict = (
                 ExperimentVerdict.PASS if not violations else ExperimentVerdict.FAIL
@@ -126,6 +136,7 @@ def execute_experiment(config_path: Path, database_path: Path) -> ExperimentRepo
                     experiment_id=experiment_id,
                     comparisons=comparisons,
                     aggregates=comparison_aggregates,
+                    slice_aggregates=slice_comparison_aggregates,
                     violations=violations,
                     verdict=verdict,
                     timestamp=datetime.now(UTC),
@@ -197,6 +208,10 @@ def compare_runs(
 def apply_regression_gate(
     aggregates: list[ComparisonAggregate],
     thresholds: dict[str, EffectiveThresholds],
+    *,
+    slice_aggregates: list[SliceComparisonAggregate] | None = None,
+    slice_thresholds: dict[int, EffectiveThresholds] | None = None,
+    slice_aware: bool = False,
 ) -> list[GateViolation]:
     """Return deterministic violations for every exceeded configured limit."""
     by_scope = {aggregate.scope: aggregate for aggregate in aggregates}
@@ -215,6 +230,9 @@ def apply_regression_gate(
                         f"{scope} score drop {score_drop:.6f} exceeds "
                         f"{effective_thresholds.max_score_drop:.6f}"
                     ),
+                    scope_kind=("global" if scope == "global" else "mode")
+                    if slice_aware
+                    else None,
                 )
             )
         if aggregate.newly_failed_count > effective_thresholds.max_new_failures:
@@ -229,6 +247,50 @@ def apply_regression_gate(
                         f"{aggregate.newly_failed_count} exceeds "
                         f"{effective_thresholds.max_new_failures}"
                     ),
+                    scope_kind=("global" if scope == "global" else "mode")
+                    if slice_aware
+                    else None,
+                )
+            )
+    slice_by_number = {
+        aggregate.cluster_number: aggregate for aggregate in (slice_aggregates or [])
+    }
+    for cluster_number, effective_thresholds in sorted(
+        (slice_thresholds or {}).items()
+    ):
+        slice_item = slice_by_number[cluster_number]
+        score_drop = max(0.0, -slice_item.score_delta)
+        if score_drop > effective_thresholds.max_score_drop:
+            violations.append(
+                GateViolation(
+                    scope=slice_item.selector,
+                    metric=GateMetric.SCORE_DROP,
+                    actual=score_drop,
+                    allowed=effective_thresholds.max_score_drop,
+                    message=(
+                        f"{slice_item.selector} score drop {score_drop:.6f} exceeds "
+                        f"{effective_thresholds.max_score_drop:.6f}"
+                    ),
+                    scope_kind="slice",
+                    cluster_number=cluster_number,
+                    label_snapshot=slice_item.label_snapshot,
+                )
+            )
+        if slice_item.newly_failed_count > effective_thresholds.max_new_failures:
+            violations.append(
+                GateViolation(
+                    scope=slice_item.selector,
+                    metric=GateMetric.NEW_FAILURES,
+                    actual=float(slice_item.newly_failed_count),
+                    allowed=float(effective_thresholds.max_new_failures),
+                    message=(
+                        f"{slice_item.selector} newly failed count "
+                        f"{slice_item.newly_failed_count} exceeds "
+                        f"{effective_thresholds.max_new_failures}"
+                    ),
+                    scope_kind="slice",
+                    cluster_number=cluster_number,
+                    label_snapshot=slice_item.label_snapshot,
                 )
             )
     return violations
@@ -275,6 +337,7 @@ def _execute_and_persist_run(
                 provider_metadata=dict(response.metadata),
             )
         aggregates = aggregate_run(results)
+        slice_aggregates = aggregate_run_slices(results, prepared.slice_membership)
         with connection:
             persist_completed_run(
                 connection,
@@ -282,6 +345,7 @@ def _execute_and_persist_run(
                 results=results,
                 generation_details=generation_details,
                 aggregates=aggregates,
+                slice_aggregates=slice_aggregates,
                 timestamp=datetime.now(UTC),
             )
         return results
@@ -522,6 +586,115 @@ def _aggregate_scope(scope: str, results: list[CaseResult]) -> RunAggregate:
         score=sum(result.score for result in results) / case_count,
         pass_rate=passed_count / case_count,
     )
+
+
+def aggregate_run_slices(
+    results: list[CaseResult],
+    membership: dict[str, SliceCaseProvenance],
+) -> list[SliceRunAggregate]:
+    """Aggregate one completed run by immutable numeric case membership."""
+    grouped: dict[int, list[CaseResult]] = {}
+    metadata: dict[int, tuple[str, str | None]] = {}
+    for result in results:
+        provenance = membership.get(result.eval_id)
+        if provenance is None:
+            continue
+        cluster_number = provenance.cluster_number
+        grouped.setdefault(cluster_number, []).append(result)
+        metadata[cluster_number] = (
+            provenance.selector,
+            provenance.label_snapshot,
+        )
+    aggregates: list[SliceRunAggregate] = []
+    for cluster_number in sorted(grouped):
+        items = grouped[cluster_number]
+        passed_count = sum(item.passed for item in items)
+        case_count = len(items)
+        selector, label = metadata[cluster_number]
+        aggregates.append(
+            SliceRunAggregate(
+                selector=selector,
+                cluster_number=cluster_number,
+                label_snapshot=label,
+                case_count=case_count,
+                passed_count=passed_count,
+                failed_count=case_count - passed_count,
+                score=sum(item.score for item in items) / case_count,
+                pass_rate=passed_count / case_count,
+            )
+        )
+    return aggregates
+
+
+def compare_run_slices(
+    baseline: list[CaseResult],
+    candidate: list[CaseResult],
+    membership: dict[str, SliceCaseProvenance],
+) -> list[SliceComparisonAggregate]:
+    """Compare completed runs by immutable numeric case membership."""
+    baseline_by_id = {item.eval_id: item for item in baseline}
+    candidate_by_id = {item.eval_id: item for item in candidate}
+    grouped: dict[int, list[CaseComparison]] = {}
+    metadata: dict[int, tuple[str, str | None]] = {}
+    for eval_id in sorted(membership):
+        provenance = membership[eval_id]
+        baseline_item = baseline_by_id[eval_id]
+        candidate_item = candidate_by_id[eval_id]
+        comparison = CaseComparison(
+            eval_id=eval_id,
+            evaluation_mode=baseline_item.evaluation_mode,
+            baseline_score=baseline_item.score,
+            candidate_score=candidate_item.score,
+            score_delta=candidate_item.score - baseline_item.score,
+            baseline_passed=baseline_item.passed,
+            candidate_passed=candidate_item.passed,
+            transition=_transition(baseline_item.passed, candidate_item.passed),
+        )
+        cluster_number = provenance.cluster_number
+        grouped.setdefault(cluster_number, []).append(comparison)
+        metadata[cluster_number] = (
+            provenance.selector,
+            provenance.label_snapshot,
+        )
+    aggregates: list[SliceComparisonAggregate] = []
+    for cluster_number in sorted(grouped):
+        items = grouped[cluster_number]
+        case_count = len(items)
+        baseline_score = sum(item.baseline_score for item in items) / case_count
+        candidate_score = sum(item.candidate_score for item in items) / case_count
+        newly_passed = sorted(
+            item.eval_id
+            for item in items
+            if item.transition is ComparisonTransition.NEWLY_PASSED
+        )
+        newly_failed = sorted(
+            item.eval_id
+            for item in items
+            if item.transition is ComparisonTransition.NEWLY_FAILED
+        )
+        selector, label = metadata[cluster_number]
+        aggregates.append(
+            SliceComparisonAggregate(
+                selector=selector,
+                cluster_number=cluster_number,
+                label_snapshot=label,
+                case_count=case_count,
+                baseline_score=baseline_score,
+                candidate_score=candidate_score,
+                score_delta=candidate_score - baseline_score,
+                baseline_pass_rate=(
+                    sum(item.baseline_passed for item in items) / case_count
+                ),
+                candidate_pass_rate=(
+                    sum(item.candidate_passed for item in items) / case_count
+                ),
+                newly_passed_count=len(newly_passed),
+                newly_failed_count=len(newly_failed),
+                newly_passed=newly_passed,
+                newly_failed=newly_failed,
+            )
+        )
+    return aggregates
 
 
 def _comparison_scope(
