@@ -17,6 +17,7 @@ from tracebench.experiment_config import (
 from tracebench.experiment_models import RunRole
 from tracebench.experiment_storage import insert_attempt
 from tracebench.models import EvaluationMode, ScorerConfig, Trace
+from tracebench.providers import FixtureProvider, ProviderError, ProviderRequest
 from tracebench.storage import connect_database, insert_trace
 
 
@@ -89,8 +90,25 @@ def test_preflight_accepts_empty_fixture_output(tmp_path: Path) -> None:
         candidate_output="",
     )
 
-    assert prepared.outputs[RunRole.BASELINE][prepared.cases[0].eval_id] == ""
-    assert prepared.outputs[RunRole.CANDIDATE][prepared.cases[0].eval_id] == ""
+    request = ProviderRequest(request_id=prepared.cases[0].eval_id, prompt="")
+    assert prepared.providers[RunRole.BASELINE].generate(request).output == ""
+    assert prepared.providers[RunRole.CANDIDATE].generate(request).output == ""
+
+
+def test_string_fixtures_repeat_while_tuple_sequences_are_consumed() -> None:
+    """Ordinary A1 fixtures are reusable while judge retry sequences advance."""
+    request = ProviderRequest(request_id="request", prompt="")
+    repeating = FixtureProvider({"request": "stable"})
+    sequenced = FixtureProvider({"request": ("first", "second")})
+
+    assert repeating.generate(request).output == "stable"
+    assert repeating.generate(request).output == "stable"
+    assert [sequenced.generate(request).output for _ in range(2)] == [
+        "first",
+        "second",
+    ]
+    with pytest.raises(ProviderError, match="attempt 3"):
+        sequenced.generate(request)
 
 
 def test_configuration_hash_ignores_name_and_file_location(tmp_path: Path) -> None:

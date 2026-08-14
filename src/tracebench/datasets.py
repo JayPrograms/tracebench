@@ -1,14 +1,20 @@
 """Workflows for versioned evaluation datasets."""
 
+import hashlib
 import json
 import os
+import sqlite3
 import tempfile
 from contextlib import closing
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO
 from uuid import UUID, uuid5
 
+from pydantic import BaseModel, ConfigDict
+
+from tracebench.clustering import build_document, canonical_trace_payload
 from tracebench.models import (
     EvalCase,
     EvalDataset,
@@ -16,11 +22,17 @@ from tracebench.models import (
     Priority,
     ReviewStatus,
     ScorerConfig,
+    SliceBuildSource,
+    SliceCaseProvenance,
+    Trace,
 )
 from tracebench.storage import (
     connect_database,
+    get_dataset_slice_build,
     get_eval_dataset,
     get_trace,
+    insert_case_slice_provenance,
+    insert_dataset_slice_build,
     insert_eval_case,
     insert_eval_dataset,
     list_eval_cases,
@@ -60,6 +72,50 @@ class DuplicateTraceError(DatasetError):
 
 class ExportFileExistsError(DatasetError):
     """Raised when export would overwrite a file without permission."""
+
+
+class DatasetBuildValidationError(DatasetError):
+    """Raised when a requested exact-size slice build is not possible."""
+
+
+class DatasetBuildIntegrityError(DatasetError):
+    """Raised when an immutable clustering snapshot no longer validates."""
+
+
+class SliceBuildSummary(BaseModel):
+    """Availability and selected quota for one numeric slice."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    selector: str
+    cluster_number: int
+    label_snapshot: str | None
+    eligible_count: int
+    selected_count: int
+    allocation_key: str
+
+
+class DatasetBuildResult(BaseModel):
+    """Completed deterministic slice-built dataset."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    dataset: EvalDataset
+    cases: tuple[EvalCase, ...]
+    slice_source: SliceBuildSource
+    slices: tuple[SliceBuildSummary, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _EligibleTrace:
+    """One trace plus the immutable inputs to deterministic preference ranking."""
+
+    assignment: sqlite3.Row
+    trace: Trace
+    critical_priority_signal: bool
+    prior_failure_signal: bool
+    preference_tier: int
+    selection_key: str
 
 
 def parse_dataset_reference(reference: str) -> tuple[str, str]:
@@ -115,6 +171,22 @@ def get_dataset_and_cases(
             raise DatasetNotFoundError(f"dataset '{reference}' was not found")
         cases = list_eval_cases(connection, dataset.dataset_id)
     return dataset, cases
+
+
+def get_dataset_details(
+    database_path: Path, reference: str
+) -> tuple[EvalDataset, list[EvalCase], SliceBuildSource | None]:
+    """Resolve a dataset with its optional sealed slice-build snapshot."""
+    name, version = parse_dataset_reference(reference)
+    with closing(connect_database(database_path)) as connection:
+        dataset = get_eval_dataset(connection, name, version)
+        if dataset is None:
+            raise DatasetNotFoundError(f"dataset '{reference}' was not found")
+        return (
+            dataset,
+            list_eval_cases(connection, dataset.dataset_id),
+            get_dataset_slice_build(connection, dataset.dataset_id),
+        )
 
 
 def get_datasets(database_path: Path) -> list[tuple[EvalDataset, int]]:
@@ -189,6 +261,391 @@ def promote_trace(
     return case
 
 
+def build_dataset_from_slices(
+    database_path: Path,
+    *,
+    name: str,
+    version: str,
+    clustering_run_name: str,
+    size: int,
+) -> DatasetBuildResult:
+    """Atomically build an exact-size balanced reference dataset from B1 slices."""
+    canonical_name, canonical_version = _canonical_dataset_identity(name, version)
+    run_name = clustering_run_name.strip()
+    if not run_name:
+        raise DatasetBuildValidationError("clustering run name must not be blank")
+    if isinstance(size, bool) or size < 1:
+        raise DatasetBuildValidationError("dataset size must be at least 1")
+
+    built_at = datetime.now(UTC)
+    dataset = EvalDataset(
+        dataset_id=generate_dataset_id(canonical_name, canonical_version),
+        name=canonical_name,
+        version=canonical_version,
+        description="",
+        created_at=built_at,
+    )
+    with closing(connect_database(database_path)) as connection:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            if (
+                get_eval_dataset(connection, canonical_name, canonical_version)
+                is not None
+            ):
+                raise DatasetAlreadyExistsError(
+                    f"dataset '{canonical_name}:{canonical_version}' already exists"
+                )
+            run = connection.execute(
+                "SELECT * FROM trace_clustering_runs WHERE name = ?", (run_name,)
+            ).fetchone()
+            if run is None:
+                raise DatasetBuildIntegrityError(
+                    f"clustering run '{run_name}' was not found"
+                )
+            config = json.loads(str(run["configuration_json"]))
+            include_context = bool(config["include_context"])
+            label_rows = connection.execute(
+                "SELECT cluster_number, label, label_key "
+                "FROM trace_cluster_labels WHERE clustering_run_id = ? "
+                "ORDER BY cluster_number ASC",
+                (run["clustering_run_id"],),
+            ).fetchall()
+            cluster_count = int(run["cluster_count"])
+            if [int(row["cluster_number"]) for row in label_rows] != list(
+                range(cluster_count)
+            ):
+                raise DatasetBuildIntegrityError(
+                    "clustering run has incomplete numeric label rows"
+                )
+            labels = {
+                int(row["cluster_number"]): (row["label"], row["label_key"])
+                for row in label_rows
+            }
+            assignment_rows = connection.execute(
+                """
+                SELECT
+                    assignment.*, trace.timestamp AS current_timestamp,
+                    trace.task_type, trace.prompt, trace.response,
+                    trace.context_json, trace.metadata_json
+                FROM trace_cluster_assignments AS assignment
+                JOIN traces AS trace ON trace.trace_id = assignment.trace_id
+                WHERE assignment.clustering_run_id = ?
+                ORDER BY assignment.document_index ASC
+                """,
+                (run["clustering_run_id"],),
+            ).fetchall()
+            if len(assignment_rows) != int(run["trace_count"]):
+                raise DatasetBuildIntegrityError(
+                    "clustering run assignment count does not match its trace count"
+                )
+            if [int(row["document_index"]) for row in assignment_rows] != list(
+                range(len(assignment_rows))
+            ):
+                raise DatasetBuildIntegrityError(
+                    "clustering run document indexes are incomplete"
+                )
+
+            critical_trace_ids, prior_failure_trace_ids = _historical_selection_signals(
+                connection
+            )
+            eligible: dict[int, list[_EligibleTrace]] = {
+                cluster_number: [] for cluster_number in range(cluster_count)
+            }
+            for row in assignment_rows:
+                cluster_number = int(row["cluster_number"])
+                if cluster_number not in eligible:
+                    raise DatasetBuildIntegrityError(
+                        "assignment cluster number is outside its run"
+                    )
+                trace = Trace.model_validate(
+                    {
+                        "trace_id": row["trace_id"],
+                        "timestamp": row["current_timestamp"],
+                        "task_type": row["task_type"],
+                        "prompt": row["prompt"],
+                        "response": row["response"],
+                        "context": json.loads(row["context_json"]),
+                        "metadata": json.loads(row["metadata_json"]),
+                    }
+                )
+                source_hash = _sha256(canonical_trace_payload(trace))
+                document_hash = _sha256(
+                    build_document(trace, include_context=include_context)
+                )
+                if (
+                    str(row["source_timestamp"]) != timestamp_to_text(trace.timestamp)
+                    or str(row["source_trace_hash"]) != source_hash
+                    or str(row["document_hash"]) != document_hash
+                ):
+                    raise DatasetBuildIntegrityError(
+                        f"trace '{trace.trace_id}' no longer matches clustering run "
+                        f"'{run_name}'"
+                    )
+                if trace.response is not None and trace.response.strip():
+                    critical_priority_signal = trace.trace_id in critical_trace_ids
+                    prior_failure_signal = trace.trace_id in prior_failure_trace_ids
+                    preference_tier = (
+                        2 - int(critical_priority_signal) - int(prior_failure_signal)
+                    )
+                    selection_key = _sha256(
+                        _canonical_json(
+                            {
+                                "algorithm": "balanced-preference-hash-v1",
+                                "cluster_number": cluster_number,
+                                "clustering_run_id": run["clustering_run_id"],
+                                "critical_priority_signal": critical_priority_signal,
+                                "document_hash": row["document_hash"],
+                                "preference_tier": preference_tier,
+                                "prior_failure_signal": prior_failure_signal,
+                                "source_trace_hash": row["source_trace_hash"],
+                                "trace_id": trace.trace_id,
+                            }
+                        )
+                    )
+                    eligible[cluster_number].append(
+                        _EligibleTrace(
+                            assignment=row,
+                            trace=trace,
+                            critical_priority_signal=critical_priority_signal,
+                            prior_failure_signal=prior_failure_signal,
+                            preference_tier=preference_tier,
+                            selection_key=selection_key,
+                        )
+                    )
+
+            eligible_count = sum(len(items) for items in eligible.values())
+            if eligible_count == 0:
+                raise DatasetBuildValidationError(
+                    "no traces in the clustering run have a nonblank source response"
+                )
+            if size > eligible_count:
+                raise DatasetBuildValidationError(
+                    f"requested dataset size {size} exceeds eligible trace count "
+                    f"{eligible_count}"
+                )
+
+            allocation_keys = {
+                cluster_number: _sha256(
+                    _canonical_json(
+                        {
+                            "algorithm": "balanced-preference-hash-v1",
+                            "cluster_number": cluster_number,
+                            "clustering_configuration_hash": run["configuration_hash"],
+                            "clustering_run_id": run["clustering_run_id"],
+                            "source_manifest_hash": run["source_manifest_hash"],
+                        }
+                    )
+                )
+                for cluster_number in range(cluster_count)
+            }
+            allocation_order = sorted(
+                range(cluster_count),
+                key=lambda number: (allocation_keys[number], number),
+            )
+            quotas = {cluster_number: 0 for cluster_number in range(cluster_count)}
+            allocated = 0
+            while allocated < size:
+                progressed = False
+                for cluster_number in allocation_order:
+                    if quotas[cluster_number] >= len(eligible[cluster_number]):
+                        continue
+                    quotas[cluster_number] += 1
+                    allocated += 1
+                    progressed = True
+                    if allocated == size:
+                        break
+                if not progressed:
+                    raise DatasetBuildIntegrityError(
+                        "sampling allocation exhausted before reaching requested size"
+                    )
+
+            manifest = [
+                {
+                    "allocation_key": allocation_keys[cluster_number],
+                    "cluster_number": cluster_number,
+                    "critical_priority_count": sum(
+                        item.critical_priority_signal
+                        for item in eligible[cluster_number]
+                    ),
+                    "eligible_count": len(eligible[cluster_number]),
+                    "label_key_snapshot": labels[cluster_number][1],
+                    "label_snapshot": labels[cluster_number][0],
+                    "preference_manifest_hash": _sha256(
+                        _canonical_json(
+                            [
+                                {
+                                    "critical_priority_signal": (
+                                        item.critical_priority_signal
+                                    ),
+                                    "preference_tier": item.preference_tier,
+                                    "prior_failure_signal": item.prior_failure_signal,
+                                    "selection_key": item.selection_key,
+                                    "trace_id": item.trace.trace_id,
+                                }
+                                for item in sorted(
+                                    eligible[cluster_number],
+                                    key=lambda candidate: candidate.trace.trace_id,
+                                )
+                            ]
+                        )
+                    ),
+                    "prior_failure_count": sum(
+                        item.prior_failure_signal for item in eligible[cluster_number]
+                    ),
+                    "quota": quotas[cluster_number],
+                    "selector": f"cluster-{cluster_number}",
+                }
+                for cluster_number in range(cluster_count)
+            ]
+            manifest_hash = _sha256(_canonical_json(manifest))
+            source = SliceBuildSource(
+                clustering_run_id=run["clustering_run_id"],
+                clustering_run_name=run["name"],
+                clustering_schema_version=run["schema_version"],
+                clustering_configuration_hash=run["configuration_hash"],
+                clustering_source_manifest_hash=run["source_manifest_hash"],
+                cluster_count=cluster_count,
+                sampling_schema_version=2,
+                sampling_algorithm="balanced-preference-hash-v1",
+                requested_size=size,
+                sampled_size=size,
+                eligible_trace_count=eligible_count,
+                slice_manifest_hash=manifest_hash,
+                slice_manifest=manifest,
+                built_at=built_at,
+            )
+            if not insert_eval_dataset(connection, dataset):
+                raise DatasetAlreadyExistsError(
+                    f"dataset '{canonical_name}:{canonical_version}' already exists"
+                )
+
+            built_cases: list[EvalCase] = []
+            for cluster_number in range(cluster_count):
+                ranked = sorted(
+                    eligible[cluster_number],
+                    key=lambda item: (
+                        item.preference_tier,
+                        item.selection_key,
+                        item.trace.trace_id,
+                    ),
+                )
+                for rank, selected in enumerate(ranked[: quotas[cluster_number]]):
+                    assignment = selected.assignment
+                    trace = selected.trace
+                    provenance = SliceCaseProvenance(
+                        selector=f"cluster-{cluster_number}",
+                        cluster_number=cluster_number,
+                        label_snapshot=labels[cluster_number][0],
+                        label_key_snapshot=labels[cluster_number][1],
+                        clustering_run_id=run["clustering_run_id"],
+                        clustering_run_name=run["name"],
+                        clustering_schema_version=run["schema_version"],
+                        clustering_configuration_hash=run["configuration_hash"],
+                        clustering_source_manifest_hash=run["source_manifest_hash"],
+                        cluster_count=cluster_count,
+                        source_trace_id=trace.trace_id,
+                        source_timestamp=trace.timestamp,
+                        source_trace_hash=assignment["source_trace_hash"],
+                        document_index=assignment["document_index"],
+                        document_hash=assignment["document_hash"],
+                        sampling_schema_version=2,
+                        sampling_algorithm="balanced-preference-hash-v1",
+                        requested_size=size,
+                        sampled_size=size,
+                        eligible_trace_count=eligible_count,
+                        slice_availability=len(eligible[cluster_number]),
+                        slice_quota=quotas[cluster_number],
+                        rank_within_slice=rank,
+                        critical_priority_signal=(selected.critical_priority_signal),
+                        prior_failure_signal=selected.prior_failure_signal,
+                        preference_tier=selected.preference_tier,
+                        selection_key=selected.selection_key,
+                        allocation_key=allocation_keys[cluster_number],
+                        slice_manifest_hash=manifest_hash,
+                    )
+                    case = EvalCase(
+                        eval_id=generate_eval_id(dataset.dataset_id, trace.trace_id),
+                        dataset_id=dataset.dataset_id,
+                        source_trace_id=trace.trace_id,
+                        source_timestamp=trace.timestamp,
+                        source_task_type=trace.task_type,
+                        source_response=trace.response,
+                        source_metadata=trace.metadata,
+                        input=trace.prompt,
+                        context=trace.context,
+                        evaluation_mode=EvaluationMode.REFERENCE,
+                        reference_answer=trace.response,
+                        rubric=[],
+                        scorers=[],
+                        priority=Priority.MEDIUM,
+                        review_status=ReviewStatus.DRAFT,
+                        created_at=built_at,
+                        slice_provenance=provenance,
+                    )
+                    if not insert_eval_case(connection, case):
+                        raise DatasetBuildIntegrityError(
+                            f"duplicate source trace '{trace.trace_id}' in build"
+                        )
+                    insert_case_slice_provenance(
+                        connection, case.eval_id, dataset.dataset_id, provenance
+                    )
+                    built_cases.append(case)
+            insert_dataset_slice_build(connection, dataset.dataset_id, source)
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+
+    summaries = tuple(
+        SliceBuildSummary(
+            selector=f"cluster-{cluster_number}",
+            cluster_number=cluster_number,
+            label_snapshot=labels[cluster_number][0],
+            eligible_count=len(eligible[cluster_number]),
+            selected_count=quotas[cluster_number],
+            allocation_key=allocation_keys[cluster_number],
+        )
+        for cluster_number in range(cluster_count)
+    )
+    return DatasetBuildResult(
+        dataset=dataset,
+        cases=tuple(sorted(built_cases, key=lambda case: case.eval_id)),
+        slice_source=source,
+        slices=summaries,
+    )
+
+
+def _historical_selection_signals(
+    connection: sqlite3.Connection,
+) -> tuple[set[str], set[str]]:
+    """Snapshot trustworthy persisted preference signals for source traces."""
+    critical_trace_ids = {
+        str(row["source_trace_id"])
+        for row in connection.execute(
+            "SELECT DISTINCT source_trace_id FROM eval_cases "
+            "WHERE priority = 'critical'"
+        ).fetchall()
+    }
+    prior_failure_trace_ids = {
+        str(row["source_trace_id"])
+        for row in connection.execute(
+            """
+            SELECT DISTINCT case_row.source_trace_id
+            FROM eval_cases AS case_row
+            JOIN experiment_case_results AS result
+              ON result.eval_id = case_row.eval_id
+            JOIN experiment_runs AS run ON run.run_id = result.run_id
+            JOIN experiments AS experiment
+              ON experiment.experiment_id = run.experiment_id
+            WHERE result.passed = 0
+              AND run.status = 'completed'
+              AND experiment.status = 'completed'
+            """
+        ).fetchall()
+    }
+    return critical_trace_ids, prior_failure_trace_ids
+
+
 def generate_dataset_id(name: str, version: str) -> str:
     """Generate a stable UUID5 ID from a canonical dataset name and version."""
     canonical_name, canonical_version = _canonical_dataset_identity(name, version)
@@ -210,7 +667,7 @@ def export_dataset(
     overwrite: bool = False,
 ) -> int:
     """Export a dataset metadata envelope followed by ordered case envelopes."""
-    dataset, cases = get_dataset_and_cases(database_path, reference)
+    dataset, cases, slice_source = get_dataset_details(database_path, reference)
     parent = output_path.parent
     if not parent.exists():
         raise OSError(f"output directory does not exist: {parent}")
@@ -229,7 +686,7 @@ def export_dataset(
             )
             temporary_path = Path(temporary_name)
             with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as output:
-                _write_export(output, dataset, cases)
+                _write_export(output, dataset, cases, slice_source)
             os.replace(temporary_path, output_path)
             temporary_path = None
         finally:
@@ -244,7 +701,7 @@ def export_dataset(
             ) from error
         try:
             with output:
-                _write_export(output, dataset, cases)
+                _write_export(output, dataset, cases, slice_source)
         except BaseException:
             try:
                 output_path.unlink(missing_ok=True)
@@ -259,8 +716,9 @@ def _write_export(
     output: TextIO,
     dataset: EvalDataset,
     cases: list[EvalCase],
+    slice_source: SliceBuildSource | None,
 ) -> None:
-    output.write(_encode_dataset_export_record(dataset))
+    output.write(_encode_dataset_export_record(dataset, slice_source))
     output.write("\n")
     for case in cases:
         output.write(_encode_case_export_record(dataset, case))
@@ -269,12 +727,16 @@ def _write_export(
     os.fsync(output.fileno())
 
 
-def _encode_dataset_export_record(dataset: EvalDataset) -> str:
+def _encode_dataset_export_record(
+    dataset: EvalDataset, slice_source: SliceBuildSource | None
+) -> str:
     payload = {
         **dataset.model_dump(mode="json"),
         "dataset_ref": f"{dataset.name}:{dataset.version}",
         "created_at": timestamp_to_text(dataset.created_at),
     }
+    if slice_source is not None:
+        payload["slice_source"] = slice_source.model_dump(mode="json")
     return _encode_export_record({"record_type": "dataset", "dataset": payload})
 
 
@@ -310,3 +772,17 @@ def _canonical_dataset_identity(name: str, version: str) -> tuple[str, str]:
 
 def _encode_identity(parts: list[str]) -> str:
     return json.dumps(parts, ensure_ascii=False, separators=(",", ":"))
+
+
+def _canonical_json(value: object) -> str:
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _sha256(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()

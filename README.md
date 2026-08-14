@@ -20,7 +20,8 @@ TraceBench is local-first and designed to work without paid services.
 
 TraceBench supports importing application traces, promoting selected traces into
 versioned evaluation datasets, and running persisted baseline-versus-candidate
-experiments with deterministic regression gates.
+experiments with deterministic regression gates, rubric judging, immutable judge
+result caching, and human-review escalation metadata.
 
 ## Trace ingestion
 
@@ -48,7 +49,62 @@ List stored traces in newest-first order:
 tracebench traces list
 ```
 
+## Reproducible trace clustering and named slices
+
+Create an immutable, version-named clustering run over the current trace snapshot:
+
+```powershell
+tracebench traces cluster --name support-slices-v1 --clusters 6
+```
+
+The default document is the stored prompt exactly as ingested. Add
+`--include-context` to use a fixed prompt/context format containing canonical
+context JSON, or `--svd-components N` to enable the optional dimensionality
+reduction step. TraceBench requires the configured SVD dimension to satisfy
+`1 <= N < min(trace count, TF-IDF feature count)`.
+
+List the resulting numeric slices and assign a human-readable label:
+
+```powershell
+tracebench slices list support-slices-v1
+tracebench slices rename support-slices-v1 0 refunds
+```
+
+Run names, configurations, source provenance, and trace assignments are immutable.
+Labels are editable metadata and are unique within a run after Unicode NFKC
+normalization and case folding. Clustering uses deterministic trace ordering and
+fixed random seeds. The configuration identity records exact TraceBench,
+scikit-learn, NumPy, and SciPy versions; assignment equivalence is not promised
+across dependency versions, platforms, or numerical runtimes.
+
 ## Versioned evaluation datasets
+
+Build an exact-size reference dataset directly from an immutable clustering run:
+
+```powershell
+tracebench dataset build `
+  --name support-eval `
+  --version 0.2 `
+  --from-slices support-slices-v1 `
+  --size 30
+```
+
+The builder considers only assigned traces with nonblank source responses. It
+allocates cases as evenly as possible across numeric clusters using deterministic
+round-robin quotas. Within each slice it first prefers traces with persisted
+critical evaluation-case priority or a failed case result from a completed prior
+experiment, treating the two signals equally, and then uses a stable SHA-256
+rank. Selected cases snapshot both signals and their derived preference tier.
+Unvalidated trace metadata never acts as priority. The requested size is exact:
+insufficient eligible traces fail without creating a dataset. Generated cases
+are reference-mode, medium-priority drafts whose exact source responses are
+snapshotted as reference answers. No LLM participates in sampling.
+
+Numeric selectors such as `cluster-0` are authoritative. Labels are optional and
+are snapshotted when the dataset is built, so later `slices rename` operations do
+not change existing datasets, exports, experiment reports, or gate resolution.
+Slice-built datasets are sealed and cannot receive later `dataset add-trace`
+promotions.
 
 Create an independent dataset version:
 
@@ -215,13 +271,37 @@ The supported scorer configurations are:
 - `required_keys`: a nonempty, unique list of required top-level JSON object `keys`
 
 Reference-mode cases use implicit case-sensitive exact matching against their
-reference answer. Rubric cases are rejected because the core loop is fully local
-and deterministic.
+reference answer. Rubric cases are evaluated by the experiment's configured judge
+provider, described below.
 
 The YAML gate defaults to zero allowed global score drop and zero newly failed
 cases. Optional `by_mode` entries may override either limit and inherit the other
 global value. An override must name a supported mode present in the dataset.
 Absent modes are omitted from results rather than represented with zero or `NaN`.
+
+Slice-built datasets also support strict label or numeric-selector overrides:
+
+```yaml
+gate:
+  max_score_drop: 0.03
+  max_new_failures: 1
+  by_slice:
+    refunds:
+      max_score_drop: 0.0
+      max_new_failures: 0
+```
+
+Each configured slice inherits omitted limits from the global gate. Missing,
+ambiguous, duplicate, or unrepresented selectors fail preflight without creating
+an experiment attempt. Unlisted slices are still aggregated and reported but do
+not receive an independent slice gate. Gate comparisons use unrounded values and
+pass at exact threshold equality.
+
+Completed experiments on slice-built datasets emit machine-readable report schema
+version `2`, including `dataset.slice_source`, per-run `by_slice` aggregates, and
+comparison `by_slice` transitions. Experiments on ordinary datasets continue to
+emit the unchanged schema-version-`1` shape. Human reports add a numeric-order
+slice table only for slice-aware experiments.
 
 Every successful preflight creates a new experiment attempt. Names are reusable
 labels, so rerunning the same name never overwrites or resumes an earlier attempt.
@@ -241,9 +321,158 @@ Experiment status and verdict are separate. A completed gate decision has status
 | `3` | Operational failure; an accepted attempt is marked failed when possible |
 
 Baseline results, candidate results, and comparison/gate results use separate
-transactions. A failed stage rolls back its partial rows; a follow-up transaction
-records the operational failure. Machine-readable reports are reconstructed from
-the normalized SQLite result, scorer, aggregate, comparison, and violation rows.
+transactions. A failed stage rolls back its partial scored rows; a follow-up
+transaction records the operational failure. Raw judge attempts use independent
+audit transactions so malformed responses remain inspectable after a failed run.
+Judge cache lookups and inserts also use short transactions that never remain open
+while waiting for a provider. Machine-readable reports are reconstructed from
+normalized SQLite rows.
+
+## Rubric judging
+
+An experiment containing rubric cases requires one judge configuration shared by
+the baseline and candidate runs. This local fixture example is suitable for tests
+and CI:
+
+```yaml
+schema_version: 1
+name: rubric-check
+dataset: support-eval:0.1
+baseline: {provider: fixture, path: support-baseline.jsonl}
+candidate: {provider: fixture, path: support-candidate.jsonl}
+judge:
+  provider: fixture
+  path: support-judge.jsonl
+  prompt_version: rubric-v1
+  prompt_file: ../prompts/judges/rubric-v1.txt
+  retry_prompt_file: ../prompts/judges/rubric-retry-v1.txt
+  confidence_threshold: 0.7
+gate:
+  max_score_drop: 0
+  max_new_failures: 0
+```
+
+The checked-in primary prompt is `prompts/judges/rubric-v1.txt`. Prompt paths are
+resolved relative to the experiment YAML and preflighted like answer-provider
+prompts. Prompt version, content hashes, judge settings, and the finite
+`confidence_threshold` in the inclusive range `[0,1]` contribute to the
+configuration hash. A result below the threshold requires human review but does
+not alter scores, gates, retries, verdicts, or exit codes.
+
+Judge fixtures contain one strict JSONL record for each rubric case and role. A
+second raw output is optional and is consumed only when the first response is
+malformed:
+
+```json
+{"eval_id":"eval_...","role":"baseline","outputs":["raw response","optional retry response"]}
+```
+
+The judge must return JSON only:
+
+```json
+{"schema_version":1,"criteria":[{"criterion":"Exact rubric criterion text","score":1.0,"passed":true,"reason":"Concise reason"}],"overall_score":1.0,"overall_passed":true,"confidence":0.9}
+```
+
+Scores and confidence are finite numbers in `[0,1]`. Criteria must exactly cover
+the stored rubric text without missing, unknown, or duplicate entries. TraceBench
+uses the equal-weight mean of criterion scores as the case score and requires
+`overall_score` to match within an absolute tolerance of `0.000001` with no
+relative tolerance. A case passes only when every criterion passes, and the
+returned `overall_passed` must agree.
+
+Each criterion appears in the existing nonempty scorer-result list with scorer
+name `rubric`. The additive rubric-only `judge` result contains the validated
+overall fields, confidence, threshold diagnostic, attempt count, cache metadata,
+and review state. `cache_hit` is always `true` or `false` for a new result; an
+in-place migration represents historical A2 results with `null`. Cache hits have
+zero attempts because no provider call occurs. Existing deterministic/reference
+JSON case objects, the top-level report schema version, and operational-failure
+JSON remain unchanged at version `1`. Raw judge outputs, cached response content,
+validation failures, latency, and provider metadata remain database-only.
+
+Successful rubric responses are cached by a SHA-256 identity covering the exact
+evaluated output, ordered rubric, other rendered judge inputs, prompt version and
+content hashes, judge model/provider identity, and every configured setting that
+affects generation. Confidence threshold and timeout are excluded because they do
+not affect a successful generation. Threshold changes can therefore reuse a
+response while deriving a new review state.
+
+Each immutable cache entry retains both the exact successful provider output and a
+canonical parsed response. `response_hash` is the SHA-256 hash of the canonical
+parsed JSON, not the raw string. Every hit validates the key identity, canonical
+JSON, hash, and that the retained raw output strictly parses into the same
+canonical response. Any mismatch is an operational integrity failure; TraceBench
+does not overwrite the entry or fall back to the provider. Malformed outputs and
+provider failures are never cached. When a malformed first response is repaired,
+only the exact successful retry output enters the cache.
+
+Concurrent callers may both observe a miss and generate without holding a
+database write lock. The first valid cache insert wins immutably for future hits.
+If another caller produced a different valid response, its run remains a miss and
+uses its own audited response; it does not claim that the winning cache row was
+the source of its result.
+
+Rubric results use the review states `not_required`, `needs_review`, and
+`reviewed`. Low confidence or failure of a `critical`-priority case produces
+`needs_review`, with both reasons retained when applicable. `reviewed` is reserved
+for a future review-editing workflow; this release adds no review-editing command
+or UI.
+
+Malformed judge JSON, schema violations, criterion coverage errors, or inconsistent
+overall fields receive at most one retry using the separately versioned retry
+prompt. Configuration, transport, timeout, provider-envelope, persistence, and
+low-confidence outcomes are never retried. Exhausting the retry is an operational
+failure with exit `3` and a null verdict.
+
+## Local model execution with Ollama
+
+An experiment role may use an Ollama-compatible local server instead of a fixture.
+TraceBench does not install or start Ollama and does not download models. Install
+Ollama, start it, and pull the selected model yourself before running the
+experiment. No API key or authentication configuration is supported.
+
+Store the versioned system prompt in a UTF-8 text file, for example
+`prompts/support-answer-v1.txt`, and reference it from the experiment YAML:
+
+```yaml
+schema_version: 1
+name: local-support-check
+dataset: support-eval:0.1
+baseline:
+  provider: fixture
+  path: support-baseline.jsonl
+candidate:
+  provider: ollama
+  base_url: http://localhost:11434
+  model: llama3.2:3b
+  prompt_version: support-answer-v1
+  system_prompt_file: ../prompts/support-answer-v1.txt
+  temperature: 0
+  timeout_seconds: 120
+  seed: 42
+gate:
+  max_score_drop: 0
+  max_new_failures: 0
+```
+
+Relative prompt paths are resolved from the experiment YAML directory. Prompt
+files may be UTF-8 with or without a byte-order mark and must contain nonblank
+text. TraceBench reads and validates them during preflight, before creating an
+experiment attempt or contacting Ollama. A missing, unreadable, invalidly encoded,
+or blank prompt therefore exits `2` and persists no attempt.
+
+The provider snapshot records `prompt_version` and a SHA-256 hash of the decoded
+prompt contents, not the prompt path or contents. Changing the prompt text changes
+the experiment configuration hash; moving an identical file does not. Generation
+requests append the evaluation input and canonical JSON context using fixed
+TraceBench delimiters and use Ollama's non-streaming `/api/generate` endpoint.
+
+Successful case rows record client-observed generation latency and selected
+Ollama response metadata, including model, termination, duration, and token-count
+fields when returned. These internal persistence additions do not change the
+current human report or `--json` schema. Connection failures, timeouts, HTTP
+errors, and invalid responses are operational failures with exit `3`; TraceBench
+does not retry, start a server, pull a missing model, or select a fallback model.
 
 By default, TraceBench stores data in `.tracebench/tracebench.sqlite3` relative
 to the current directory. Override the location for tests or local workflows
