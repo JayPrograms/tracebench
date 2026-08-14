@@ -6,6 +6,7 @@ import os
 import sqlite3
 import tempfile
 from contextlib import closing
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO
@@ -103,6 +104,18 @@ class DatasetBuildResult(BaseModel):
     cases: tuple[EvalCase, ...]
     slice_source: SliceBuildSource
     slices: tuple[SliceBuildSummary, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _EligibleTrace:
+    """One trace plus the immutable inputs to deterministic preference ranking."""
+
+    assignment: sqlite3.Row
+    trace: Trace
+    critical_priority_signal: bool
+    prior_failure_signal: bool
+    preference_tier: int
+    selection_key: str
 
 
 def parse_dataset_reference(reference: str) -> tuple[str, str]:
@@ -332,7 +345,10 @@ def build_dataset_from_slices(
                     "clustering run document indexes are incomplete"
                 )
 
-            eligible: dict[int, list[tuple[sqlite3.Row, Trace, str]]] = {
+            critical_trace_ids, prior_failure_trace_ids = _historical_selection_signals(
+                connection
+            )
+            eligible: dict[int, list[_EligibleTrace]] = {
                 cluster_number: [] for cluster_number in range(cluster_count)
             }
             for row in assignment_rows:
@@ -366,19 +382,36 @@ def build_dataset_from_slices(
                         f"'{run_name}'"
                     )
                 if trace.response is not None and trace.response.strip():
+                    critical_priority_signal = trace.trace_id in critical_trace_ids
+                    prior_failure_signal = trace.trace_id in prior_failure_trace_ids
+                    preference_tier = (
+                        2 - int(critical_priority_signal) - int(prior_failure_signal)
+                    )
                     selection_key = _sha256(
                         _canonical_json(
                             {
-                                "algorithm": "balanced-hash-v1",
+                                "algorithm": "balanced-preference-hash-v1",
                                 "cluster_number": cluster_number,
                                 "clustering_run_id": run["clustering_run_id"],
+                                "critical_priority_signal": critical_priority_signal,
                                 "document_hash": row["document_hash"],
+                                "preference_tier": preference_tier,
+                                "prior_failure_signal": prior_failure_signal,
                                 "source_trace_hash": row["source_trace_hash"],
                                 "trace_id": trace.trace_id,
                             }
                         )
                     )
-                    eligible[cluster_number].append((row, trace, selection_key))
+                    eligible[cluster_number].append(
+                        _EligibleTrace(
+                            assignment=row,
+                            trace=trace,
+                            critical_priority_signal=critical_priority_signal,
+                            prior_failure_signal=prior_failure_signal,
+                            preference_tier=preference_tier,
+                            selection_key=selection_key,
+                        )
+                    )
 
             eligible_count = sum(len(items) for items in eligible.values())
             if eligible_count == 0:
@@ -395,7 +428,7 @@ def build_dataset_from_slices(
                 cluster_number: _sha256(
                     _canonical_json(
                         {
-                            "algorithm": "balanced-hash-v1",
+                            "algorithm": "balanced-preference-hash-v1",
                             "cluster_number": cluster_number,
                             "clustering_configuration_hash": run["configuration_hash"],
                             "clustering_run_id": run["clustering_run_id"],
@@ -430,9 +463,35 @@ def build_dataset_from_slices(
                 {
                     "allocation_key": allocation_keys[cluster_number],
                     "cluster_number": cluster_number,
+                    "critical_priority_count": sum(
+                        item.critical_priority_signal
+                        for item in eligible[cluster_number]
+                    ),
                     "eligible_count": len(eligible[cluster_number]),
                     "label_key_snapshot": labels[cluster_number][1],
                     "label_snapshot": labels[cluster_number][0],
+                    "preference_manifest_hash": _sha256(
+                        _canonical_json(
+                            [
+                                {
+                                    "critical_priority_signal": (
+                                        item.critical_priority_signal
+                                    ),
+                                    "preference_tier": item.preference_tier,
+                                    "prior_failure_signal": item.prior_failure_signal,
+                                    "selection_key": item.selection_key,
+                                    "trace_id": item.trace.trace_id,
+                                }
+                                for item in sorted(
+                                    eligible[cluster_number],
+                                    key=lambda candidate: candidate.trace.trace_id,
+                                )
+                            ]
+                        )
+                    ),
+                    "prior_failure_count": sum(
+                        item.prior_failure_signal for item in eligible[cluster_number]
+                    ),
                     "quota": quotas[cluster_number],
                     "selector": f"cluster-{cluster_number}",
                 }
@@ -446,8 +505,8 @@ def build_dataset_from_slices(
                 clustering_configuration_hash=run["configuration_hash"],
                 clustering_source_manifest_hash=run["source_manifest_hash"],
                 cluster_count=cluster_count,
-                sampling_schema_version=1,
-                sampling_algorithm="balanced-hash-v1",
+                sampling_schema_version=2,
+                sampling_algorithm="balanced-preference-hash-v1",
                 requested_size=size,
                 sampled_size=size,
                 eligible_trace_count=eligible_count,
@@ -464,11 +523,15 @@ def build_dataset_from_slices(
             for cluster_number in range(cluster_count):
                 ranked = sorted(
                     eligible[cluster_number],
-                    key=lambda item: (item[2], item[1].trace_id),
+                    key=lambda item: (
+                        item.preference_tier,
+                        item.selection_key,
+                        item.trace.trace_id,
+                    ),
                 )
-                for rank, (assignment, trace, selection_key) in enumerate(
-                    ranked[: quotas[cluster_number]]
-                ):
+                for rank, selected in enumerate(ranked[: quotas[cluster_number]]):
+                    assignment = selected.assignment
+                    trace = selected.trace
                     provenance = SliceCaseProvenance(
                         selector=f"cluster-{cluster_number}",
                         cluster_number=cluster_number,
@@ -485,15 +548,18 @@ def build_dataset_from_slices(
                         source_trace_hash=assignment["source_trace_hash"],
                         document_index=assignment["document_index"],
                         document_hash=assignment["document_hash"],
-                        sampling_schema_version=1,
-                        sampling_algorithm="balanced-hash-v1",
+                        sampling_schema_version=2,
+                        sampling_algorithm="balanced-preference-hash-v1",
                         requested_size=size,
                         sampled_size=size,
                         eligible_trace_count=eligible_count,
                         slice_availability=len(eligible[cluster_number]),
                         slice_quota=quotas[cluster_number],
                         rank_within_slice=rank,
-                        selection_key=selection_key,
+                        critical_priority_signal=(selected.critical_priority_signal),
+                        prior_failure_signal=selected.prior_failure_signal,
+                        preference_tier=selected.preference_tier,
+                        selection_key=selected.selection_key,
                         allocation_key=allocation_keys[cluster_number],
                         slice_manifest_hash=manifest_hash,
                     )
@@ -547,6 +613,37 @@ def build_dataset_from_slices(
         slice_source=source,
         slices=summaries,
     )
+
+
+def _historical_selection_signals(
+    connection: sqlite3.Connection,
+) -> tuple[set[str], set[str]]:
+    """Snapshot trustworthy persisted preference signals for source traces."""
+    critical_trace_ids = {
+        str(row["source_trace_id"])
+        for row in connection.execute(
+            "SELECT DISTINCT source_trace_id FROM eval_cases "
+            "WHERE priority = 'critical'"
+        ).fetchall()
+    }
+    prior_failure_trace_ids = {
+        str(row["source_trace_id"])
+        for row in connection.execute(
+            """
+            SELECT DISTINCT case_row.source_trace_id
+            FROM eval_cases AS case_row
+            JOIN experiment_case_results AS result
+              ON result.eval_id = case_row.eval_id
+            JOIN experiment_runs AS run ON run.run_id = result.run_id
+            JOIN experiments AS experiment
+              ON experiment.experiment_id = run.experiment_id
+            WHERE result.passed = 0
+              AND run.status = 'completed'
+              AND experiment.status = 'completed'
+            """
+        ).fetchall()
+    }
+    return critical_trace_ids, prior_failure_trace_ids
 
 
 def generate_dataset_id(name: str, version: str) -> str:

@@ -560,6 +560,11 @@ def _canonical_configuration(
             definition["slice"] = {
                 "selector": case.slice_provenance.selector,
                 "cluster_number": case.slice_provenance.cluster_number,
+                "critical_priority_signal": (
+                    case.slice_provenance.critical_priority_signal
+                ),
+                "preference_tier": case.slice_provenance.preference_tier,
+                "prior_failure_signal": case.slice_provenance.prior_failure_signal,
                 "slice_manifest_hash": case.slice_provenance.slice_manifest_hash,
                 "selection_key": case.slice_provenance.selection_key,
             }

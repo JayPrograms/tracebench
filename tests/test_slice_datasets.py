@@ -14,13 +14,26 @@ from tracebench.clustering import create_clustering_run, rename_slice
 from tracebench.datasets import (
     DatasetBuildValidationError,
     build_dataset_from_slices,
+    create_dataset,
     get_dataset_details,
     promote_trace,
 )
 from tracebench.experiment_config import ExperimentPreflightError, prepare_experiment
-from tracebench.experiment_models import ExperimentVerdict
-from tracebench.experiments import execute_experiment
-from tracebench.models import EvaluationMode, Trace
+from tracebench.experiment_models import (
+    ComparisonAggregate,
+    EffectiveThresholds,
+    ExperimentStatus,
+    ExperimentVerdict,
+    SliceComparisonAggregate,
+)
+from tracebench.experiment_storage import load_experiment_report
+from tracebench.experiments import (
+    ExperimentOperationalError,
+    apply_regression_gate,
+    execute_experiment,
+)
+from tracebench.models import EvaluationMode, Priority, Trace
+from tracebench.providers import OllamaProvider, ProviderError
 from tracebench.storage import connect_database, insert_trace
 
 runner = CliRunner()
@@ -87,6 +100,8 @@ def test_slice_build_is_exact_balanced_reproducible_and_sealed(tmp_path: Path) -
     assert all(case.review_status.value == "draft" for case in first.cases)
     assert all(case.slice_provenance is not None for case in first.cases)
     assert first.slice_source.clustering_run_id == clustered.run.clustering_run_id
+    assert first.slice_source.sampling_schema_version == 2
+    assert first.slice_source.sampling_algorithm == "balanced-preference-hash-v1"
 
     rename_slice(database_path, "support-slices-v1", 0, "Renamed")
     _, loaded, source = get_dataset_details(database_path, "support-eval:0.2")
@@ -259,6 +274,283 @@ gate:
         assert connection.execute("SELECT COUNT(*) FROM experiments").fetchone()[0] == 0
 
 
+def test_sampling_prefers_snapshotted_critical_and_completed_failure_signals(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "preference.sqlite3"
+    _store_traces(database_path)
+    create_dataset(database_path, name="history", version="1")
+    critical = promote_trace(
+        database_path,
+        dataset_reference="history:1",
+        trace_id="trace-0",
+        mode=EvaluationMode.REFERENCE,
+        use_source_response=True,
+        priority=Priority.CRITICAL,
+    )
+    failed = promote_trace(
+        database_path,
+        dataset_reference="history:1",
+        trace_id="trace-1",
+        mode=EvaluationMode.REFERENCE,
+        use_source_response=True,
+    )
+    records = [
+        {"eval_id": critical.eval_id, "output": critical.reference_answer},
+        {"eval_id": failed.eval_id, "output": "wrong"},
+    ]
+    for filename in ("history-baseline.jsonl", "history-candidate.jsonl"):
+        (tmp_path / filename).write_text(
+            "\n".join(json.dumps(record) for record in records) + "\n",
+            encoding="utf-8",
+        )
+    config_path = tmp_path / "history.yaml"
+    config_path.write_text(
+        """schema_version: 1
+name: completed-history
+dataset: history:1
+baseline: {provider: fixture, path: history-baseline.jsonl}
+candidate: {provider: fixture, path: history-candidate.jsonl}
+gate: {max_score_drop: 0, max_new_failures: 0}
+""",
+        encoding="utf-8",
+    )
+    completed = execute_experiment(config_path, database_path)
+    assert completed.status is ExperimentStatus.COMPLETED
+
+    create_clustering_run(database_path, name="preference-slices", clusters=1)
+    built = build_dataset_from_slices(
+        database_path,
+        name="preferred",
+        version="1",
+        clustering_run_name="preference-slices",
+        size=2,
+    )
+
+    assert {case.source_trace_id for case in built.cases} == {"trace-0", "trace-1"}
+    snapshots = {case.source_trace_id: case.slice_provenance for case in built.cases}
+    critical_snapshot = snapshots["trace-0"]
+    failed_snapshot = snapshots["trace-1"]
+    assert critical_snapshot is not None
+    assert failed_snapshot is not None
+    assert critical_snapshot.critical_priority_signal is True
+    assert critical_snapshot.prior_failure_signal is False
+    assert critical_snapshot.preference_tier == 1
+    assert failed_snapshot.critical_priority_signal is False
+    assert failed_snapshot.prior_failure_signal is True
+    assert failed_snapshot.preference_tier == 1
+
+    _, loaded, source = get_dataset_details(database_path, "preferred:1")
+    assert source is not None
+    assert source.sampling_algorithm == "balanced-preference-hash-v1"
+    assert {case.source_trace_id: case.slice_provenance for case in loaded} == snapshots
+
+
+def test_sampling_handles_size_below_slice_count_and_capacity_redistribution(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "allocation-boundaries.sqlite3"
+    _store_traces(database_path)
+    create_clustering_run(database_path, name="discovery", clusters=3)
+
+    below_slice_count = build_dataset_from_slices(
+        database_path,
+        name="small",
+        version="1",
+        clustering_run_name="discovery",
+        size=2,
+    )
+    selected = [item.selected_count for item in below_slice_count.slices]
+    assert sum(selected) == 2
+    assert sorted(selected) == [0, 1, 1]
+
+    with closing(connect_database(database_path)) as connection:
+        rows = connection.execute(
+            "SELECT trace_id, cluster_number FROM trace_cluster_assignments "
+            "WHERE clustering_run_id = ? ORDER BY trace_id",
+            (below_slice_count.slice_source.clustering_run_id,),
+        ).fetchall()
+        target_cluster = int(rows[0]["cluster_number"])
+        target_ids = [
+            str(row["trace_id"])
+            for row in rows
+            if int(row["cluster_number"]) == target_cluster
+        ]
+        with connection:
+            for trace_id in target_ids[1:]:
+                connection.execute(
+                    "UPDATE traces SET response = NULL WHERE trace_id = ?",
+                    (trace_id,),
+                )
+
+    create_clustering_run(database_path, name="skewed", clusters=3)
+    skewed = build_dataset_from_slices(
+        database_path,
+        name="redistributed",
+        version="1",
+        clustering_run_name="skewed",
+        size=4,
+    )
+    by_cluster = {item.cluster_number: item for item in skewed.slices}
+    assert by_cluster[target_cluster].eligible_count == 1
+    assert by_cluster[target_cluster].selected_count == 1
+    assert sum(item.selected_count for item in skewed.slices) == 4
+
+
+def test_slice_selector_ambiguity_and_duplicate_resolution_fail_preflight(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "selector-boundaries.sqlite3"
+    _store_traces(database_path, count=4)
+
+    create_clustering_run(database_path, name="ambiguous", clusters=2)
+    rename_slice(database_path, "ambiguous", 1, "cluster-0")
+    build_dataset_from_slices(
+        database_path,
+        name="ambiguous-data",
+        version="1",
+        clustering_run_name="ambiguous",
+        size=4,
+    )
+    ambiguous_path = tmp_path / "ambiguous.yaml"
+    ambiguous_path.write_text(
+        """schema_version: 1
+name: ambiguous
+dataset: ambiguous-data:1
+baseline: {provider: fixture, path: unused-baseline.jsonl}
+candidate: {provider: fixture, path: unused-candidate.jsonl}
+gate:
+  by_slice:
+    cluster-0: {max_new_failures: 0}
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ExperimentPreflightError, match="ambiguous"):
+        prepare_experiment(ambiguous_path, database_path)
+
+    create_clustering_run(database_path, name="duplicate", clusters=2)
+    rename_slice(database_path, "duplicate", 0, "refunds")
+    build_dataset_from_slices(
+        database_path,
+        name="duplicate-data",
+        version="1",
+        clustering_run_name="duplicate",
+        size=4,
+    )
+    duplicate_path = tmp_path / "duplicate.yaml"
+    duplicate_path.write_text(
+        """schema_version: 1
+name: duplicate
+dataset: duplicate-data:1
+baseline: {provider: fixture, path: unused-baseline.jsonl}
+candidate: {provider: fixture, path: unused-candidate.jsonl}
+gate:
+  by_slice:
+    cluster-0: {max_score_drop: 0}
+    refunds: {max_new_failures: 0}
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ExperimentPreflightError, match="multiple slice overrides"):
+        prepare_experiment(duplicate_path, database_path)
+
+
+def test_slice_gate_passes_at_exact_threshold_equality() -> None:
+    global_aggregate = ComparisonAggregate(
+        scope="global",
+        case_count=2,
+        baseline_score=1.0,
+        candidate_score=1.0,
+        score_delta=0.0,
+        newly_passed_count=0,
+        newly_failed_count=0,
+    )
+    slice_aggregate = SliceComparisonAggregate(
+        selector="cluster-0",
+        cluster_number=0,
+        label_snapshot=None,
+        case_count=2,
+        baseline_score=1.0,
+        candidate_score=0.5,
+        score_delta=-0.5,
+        baseline_pass_rate=1.0,
+        candidate_pass_rate=0.5,
+        newly_passed_count=0,
+        newly_failed_count=1,
+        newly_passed=[],
+        newly_failed=["eval-regressed"],
+    )
+
+    assert (
+        apply_regression_gate(
+            [global_aggregate],
+            {"global": EffectiveThresholds(max_score_drop=0.0, max_new_failures=0)},
+            slice_aggregates=[slice_aggregate],
+            slice_thresholds={
+                0: EffectiveThresholds(max_score_drop=0.5, max_new_failures=1)
+            },
+            slice_aware=True,
+        )
+        == []
+    )
+
+
+def test_slice_aware_operational_failure_reconstructs_schema_two_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "slice-operational.sqlite3"
+    _store_traces(database_path, count=2)
+    create_clustering_run(database_path, name="operational", clusters=1)
+    built = build_dataset_from_slices(
+        database_path,
+        name="operational-data",
+        version="1",
+        clustering_run_name="operational",
+        size=2,
+    )
+    (tmp_path / "baseline.jsonl").write_text(
+        "\n".join(
+            json.dumps({"eval_id": case.eval_id, "output": case.reference_answer})
+            for case in built.cases
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "system.txt").write_text("Answer locally.", encoding="utf-8")
+    config_path = tmp_path / "operational.yaml"
+    config_path.write_text(
+        """schema_version: 1
+name: slice-operational
+dataset: operational-data:1
+baseline: {provider: fixture, path: baseline.jsonl}
+candidate:
+  provider: ollama
+  base_url: http://localhost:11434
+  model: local-test
+  prompt_version: answer-v1
+  system_prompt_file: system.txt
+  temperature: 0
+  timeout_seconds: 1
+""",
+        encoding="utf-8",
+    )
+
+    def fail_generation(*args: object, **kwargs: object) -> object:
+        raise ProviderError("simulated local provider failure")
+
+    monkeypatch.setattr(OllamaProvider, "generate", fail_generation)
+    with pytest.raises(ExperimentOperationalError) as captured:
+        execute_experiment(config_path, database_path)
+
+    with closing(connect_database(database_path)) as connection:
+        report = load_experiment_report(connection, captured.value.experiment_id)
+    assert report.schema_version == 2
+    assert report.status is ExperimentStatus.FAILED
+    assert report.verdict is None
+    assert report.dataset.slice_source is not None
+    assert report.failure_stage == "candidate"
+
+
 def test_dataset_build_cli_reports_sampling_and_exact_shortfall(tmp_path: Path) -> None:
     database_path = tmp_path / "cli.sqlite3"
     _store_traces(database_path, count=3)
@@ -284,7 +576,7 @@ def test_dataset_build_cli_reports_sampling_and_exact_shortfall(tmp_path: Path) 
 
     assert success.exit_code == 0, success.output
     assert "Created dataset cli-eval:1" in success.stdout
-    assert "Sampling algorithm: balanced-hash-v1" in success.stdout
+    assert "Sampling algorithm: balanced-preference-hash-v1" in success.stdout
     assert "Eligible traces: 3" in success.stdout
     assert "Cases created: 2" in success.stdout
     assert "cluster-0" in success.stdout

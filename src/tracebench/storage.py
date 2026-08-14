@@ -208,8 +208,9 @@ CREATE TABLE IF NOT EXISTS eval_dataset_slice_builds (
         CHECK (length(clustering_source_manifest_hash) = 64
             AND clustering_source_manifest_hash NOT GLOB '*[^0-9a-f]*'),
     cluster_count INTEGER NOT NULL CHECK (cluster_count > 0),
-    sampling_schema_version INTEGER NOT NULL CHECK (sampling_schema_version = 1),
-    sampling_algorithm TEXT NOT NULL CHECK (sampling_algorithm = 'balanced-hash-v1'),
+    sampling_schema_version INTEGER NOT NULL CHECK (sampling_schema_version = 2),
+    sampling_algorithm TEXT NOT NULL
+        CHECK (sampling_algorithm = 'balanced-preference-hash-v1'),
     requested_size INTEGER NOT NULL CHECK (requested_size > 0),
     sampled_size INTEGER NOT NULL CHECK (sampled_size = requested_size),
     eligible_trace_count INTEGER NOT NULL
@@ -251,8 +252,9 @@ CREATE TABLE IF NOT EXISTS eval_case_slice_provenance (
     document_hash TEXT NOT NULL
         CHECK (length(document_hash) = 64
             AND document_hash NOT GLOB '*[^0-9a-f]*'),
-    sampling_schema_version INTEGER NOT NULL CHECK (sampling_schema_version = 1),
-    sampling_algorithm TEXT NOT NULL CHECK (sampling_algorithm = 'balanced-hash-v1'),
+    sampling_schema_version INTEGER NOT NULL CHECK (sampling_schema_version = 2),
+    sampling_algorithm TEXT NOT NULL
+        CHECK (sampling_algorithm = 'balanced-preference-hash-v1'),
     requested_size INTEGER NOT NULL CHECK (requested_size > 0),
     sampled_size INTEGER NOT NULL CHECK (sampled_size = requested_size),
     eligible_trace_count INTEGER NOT NULL CHECK (eligible_trace_count >= sampled_size),
@@ -261,6 +263,10 @@ CREATE TABLE IF NOT EXISTS eval_case_slice_provenance (
         CHECK (slice_quota > 0 AND slice_quota <= slice_availability),
     rank_within_slice INTEGER NOT NULL
         CHECK (rank_within_slice >= 0 AND rank_within_slice < slice_availability),
+    critical_priority_signal INTEGER NOT NULL
+        CHECK (critical_priority_signal IN (0, 1)),
+    prior_failure_signal INTEGER NOT NULL CHECK (prior_failure_signal IN (0, 1)),
+    preference_tier INTEGER NOT NULL CHECK (preference_tier BETWEEN 0 AND 2),
     selection_key TEXT NOT NULL
         CHECK (length(selection_key) = 64
             AND selection_key NOT GLOB '*[^0-9a-f]*'),
@@ -273,6 +279,9 @@ CREATE TABLE IF NOT EXISTS eval_case_slice_provenance (
     CHECK (selector = 'cluster-' || CAST(cluster_number AS TEXT)),
     CHECK ((label_snapshot IS NULL AND label_key_snapshot IS NULL)
         OR (length(label_snapshot) > 0 AND length(label_key_snapshot) > 0)),
+    CHECK (
+        preference_tier = 2 - critical_priority_signal - prior_failure_signal
+    ),
     FOREIGN KEY (dataset_id, clustering_run_id)
         REFERENCES eval_dataset_slice_builds(dataset_id, clustering_run_id)
         ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
@@ -1500,6 +1509,9 @@ def _ensure_b2_schema_compatible(connection: sqlite3.Connection) -> None:
             "source_trace_hash",
             "selection_key",
             "slice_manifest_hash",
+            "critical_priority_signal",
+            "prior_failure_signal",
+            "preference_tier",
         },
         "experiment_run_slice_aggregates": {
             "run_id",
@@ -1959,11 +1971,12 @@ def insert_case_slice_provenance(
             source_trace_hash, document_index, document_hash,
             sampling_schema_version, sampling_algorithm, requested_size,
             sampled_size, eligible_trace_count, slice_availability,
-            slice_quota, rank_within_slice, selection_key, allocation_key,
-            slice_manifest_hash
+            slice_quota, rank_within_slice, critical_priority_signal,
+            prior_failure_signal, preference_tier, selection_key,
+            allocation_key, slice_manifest_hash
         ) VALUES (
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         """,
         (
@@ -1992,6 +2005,9 @@ def insert_case_slice_provenance(
             provenance.slice_availability,
             provenance.slice_quota,
             provenance.rank_within_slice,
+            int(provenance.critical_priority_signal),
+            int(provenance.prior_failure_signal),
+            provenance.preference_tier,
             provenance.selection_key,
             provenance.allocation_key,
             provenance.slice_manifest_hash,
@@ -2123,6 +2139,9 @@ def _slice_case_provenance_from_row(row: sqlite3.Row) -> SliceCaseProvenance:
                 "slice_availability",
                 "slice_quota",
                 "rank_within_slice",
+                "critical_priority_signal",
+                "prior_failure_signal",
+                "preference_tier",
                 "selection_key",
                 "allocation_key",
                 "slice_manifest_hash",

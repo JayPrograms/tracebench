@@ -91,11 +91,14 @@ tracebench dataset build `
 
 The builder considers only assigned traces with nonblank source responses. It
 allocates cases as evenly as possible across numeric clusters using deterministic
-round-robin quotas, then selects traces by stable SHA-256 ranks. The requested
-size is exact: insufficient eligible traces fail without creating a dataset.
-Generated cases are reference-mode, medium-priority drafts whose exact source
-responses are snapshotted as reference answers. No LLM, trace metadata priority,
-or prior experiment result participates in sampling.
+round-robin quotas. Within each slice it first prefers traces with persisted
+critical evaluation-case priority or a failed case result from a completed prior
+experiment, treating the two signals equally, and then uses a stable SHA-256
+rank. Selected cases snapshot both signals and their derived preference tier.
+Unvalidated trace metadata never acts as priority. The requested size is exact:
+insufficient eligible traces fail without creating a dataset. Generated cases
+are reference-mode, medium-priority drafts whose exact source responses are
+snapshotted as reference answers. No LLM participates in sampling.
 
 Numeric selectors such as `cluster-0` are authoritative. Labels are optional and
 are snapshotted when the dataset is built, so later `slices rename` operations do

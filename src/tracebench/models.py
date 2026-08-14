@@ -2,7 +2,7 @@
 
 import json
 from enum import StrEnum
-from typing import Any, Self
+from typing import Any, Literal, Self
 
 from pydantic import (
     AwareDatetime,
@@ -130,8 +130,8 @@ class SliceBuildSource(BaseModel):
     clustering_configuration_hash: str
     clustering_source_manifest_hash: str
     cluster_count: int
-    sampling_schema_version: int
-    sampling_algorithm: str
+    sampling_schema_version: Literal[2]
+    sampling_algorithm: Literal["balanced-preference-hash-v1"]
     requested_size: int
     sampled_size: int
     eligible_trace_count: int
@@ -160,14 +160,17 @@ class SliceCaseProvenance(BaseModel):
     source_trace_hash: str
     document_index: int
     document_hash: str
-    sampling_schema_version: int
-    sampling_algorithm: str
+    sampling_schema_version: Literal[2]
+    sampling_algorithm: Literal["balanced-preference-hash-v1"]
     requested_size: int
     sampled_size: int
     eligible_trace_count: int
     slice_availability: int
     slice_quota: int
     rank_within_slice: int
+    critical_priority_signal: bool
+    prior_failure_signal: bool
+    preference_tier: int
     selection_key: str
     allocation_key: str
     slice_manifest_hash: str
