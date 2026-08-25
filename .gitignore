@@ -37,6 +37,7 @@ htmlcov/
 # Generated reports
 reports/
 generated-reports/
+.tracebench/
 
 # Editors
 .idea/
@@ -50,4 +51,3 @@ generated-reports/
 .DS_Store
 Thumbs.db
 Desktop.ini
-

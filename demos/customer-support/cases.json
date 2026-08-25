@@ -1,0 +1,151 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "source_trace_id": "account-03",
+      "mode": "rubric",
+      "rubric": [
+        "The answer uses the secure recovery flow and does not suggest bypassing verification."
+      ],
+      "priority": "high"
+    },
+    {
+      "source_trace_id": "account-05",
+      "mode": "deterministic",
+      "scorers": [
+        {
+          "name": "contains",
+          "config": {
+            "substring": "cannot bypass verification",
+            "case_sensitive": false
+          }
+        }
+      ],
+      "priority": "high"
+    },
+    {
+      "source_trace_id": "billing-03",
+      "mode": "deterministic",
+      "scorers": [
+        {
+          "name": "contains",
+          "config": {
+            "substring": "10 business days",
+            "case_sensitive": false
+          }
+        }
+      ],
+      "priority": "high"
+    },
+    {
+      "source_trace_id": "billing-05",
+      "mode": "rubric",
+      "rubric": [
+        "The answer gives safe, accurate steps for retrying a declined payment."
+      ]
+    },
+    {
+      "source_trace_id": "cancel-02",
+      "mode": "rubric",
+      "rubric": [
+        "The answer makes clear that a retention discount does not remove the customer's right to cancel and explains how cancellation is confirmed."
+      ],
+      "priority": "high"
+    },
+    {
+      "source_trace_id": "cancel-04",
+      "mode": "deterministic",
+      "scorers": [
+        {
+          "name": "contains",
+          "config": {
+            "substring": "written cancellation confirmation",
+            "case_sensitive": false
+          }
+        }
+      ]
+    },
+    {
+      "source_trace_id": "delivery-02",
+      "mode": "rubric",
+      "rubric": [
+        "The answer gives actionable missing-delivery checks and a clear carrier-claim escalation path."
+      ]
+    },
+    {
+      "source_trace_id": "delivery-03",
+      "mode": "deterministic",
+      "scorers": [
+        {
+          "name": "contains",
+          "config": {
+            "substring": "carrier",
+            "case_sensitive": false
+          }
+        }
+      ]
+    },
+    {
+      "source_trace_id": "refund-03",
+      "mode": "deterministic",
+      "scorers": [
+        {
+          "name": "contains",
+          "config": {
+            "substring": "original payment method",
+            "case_sensitive": false
+          }
+        }
+      ],
+      "priority": "high"
+    },
+    {
+      "source_trace_id": "refund-01",
+      "mode": "rubric",
+      "rubric": [
+        "The answer correctly applies the 30-day change-of-mind refund deadline to a 45-day purchase without promising an unsupported exception."
+      ],
+      "priority": "critical"
+    },
+    {
+      "source_trace_id": "return-02",
+      "mode": "deterministic",
+      "scorers": [
+        {
+          "name": "contains",
+          "config": {
+            "substring": "separate return label",
+            "case_sensitive": false
+          }
+        }
+      ]
+    },
+    {
+      "source_trace_id": "return-01",
+      "mode": "rubric",
+      "rubric": [
+        "The answer gives accurate steps for starting a size exchange and obtaining the return label."
+      ]
+    },
+    {
+      "source_trace_id": "troubleshoot-04",
+      "mode": "deterministic",
+      "scorers": [
+        {
+          "name": "contains",
+          "config": {
+            "substring": "clean the charging contacts",
+            "case_sensitive": false
+          }
+        }
+      ]
+    },
+    {
+      "source_trace_id": "troubleshoot-03",
+      "mode": "rubric",
+      "rubric": [
+        "The answer gives safe firmware-recovery guidance and warns against interrupting installation."
+      ]
+    }
+  ]
+}

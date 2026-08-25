@@ -11,6 +11,7 @@ from tracebench.models import (
     Priority,
     ReviewStatus,
     ScorerConfig,
+    SliceCaseFile,
     Trace,
 )
 
@@ -262,6 +263,91 @@ def test_scorer_configuration_is_strict_json() -> None:
         ScorerConfig.model_validate({"name": "numeric", "config": {"x": float("nan")}})
     with pytest.raises(ValidationError, match="Extra inputs"):
         ScorerConfig.model_validate({"name": "exact", "unknown": True})
+
+
+def test_slice_case_file_accepts_strict_versioned_mode_overrides() -> None:
+    """Case files support all modes while keeping definitions unambiguous."""
+    case_file = SliceCaseFile.model_validate(
+        {
+            "schema_version": 1,
+            "cases": [
+                {"source_trace_id": "reference", "mode": "reference"},
+                {
+                    "source_trace_id": "deterministic",
+                    "mode": "deterministic",
+                    "scorers": [{"name": "contains", "config": {"substring": "x"}}],
+                    "priority": "high",
+                },
+                {
+                    "source_trace_id": "rubric",
+                    "mode": "rubric",
+                    "rubric": [" Correct ", "Relevant"],
+                    "priority": "critical",
+                    "review_status": "approved",
+                },
+            ],
+        }
+    )
+
+    assert [case.mode.value for case in case_file.cases] == [
+        "reference",
+        "deterministic",
+        "rubric",
+    ]
+    assert case_file.cases[2].rubric == ["Correct", "Relevant"]
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        (
+            {
+                "schema_version": 2,
+                "cases": [{"source_trace_id": "x", "mode": "reference"}],
+            },
+            "Input should be 1",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "cases": [
+                    {"source_trace_id": "x", "mode": "reference"},
+                    {"source_trace_id": " x ", "mode": "reference"},
+                ],
+            },
+            "duplicate source_trace_id",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "cases": [{"source_trace_id": "x", "mode": "deterministic"}],
+            },
+            "requires at least one scorer",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "cases": [{"source_trace_id": "x", "mode": "rubric"}],
+            },
+            "requires at least one rubric",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "cases": [
+                    {"source_trace_id": "x", "mode": "reference", "unknown": True}
+                ],
+            },
+            "Extra inputs",
+        ),
+    ],
+)
+def test_slice_case_file_rejects_invalid_or_ambiguous_definitions(
+    payload: dict[str, object], message: str
+) -> None:
+    """Schema, uniqueness, mode requirements, and keys are strict."""
+    with pytest.raises(ValidationError, match=message):
+        SliceCaseFile.model_validate(payload)
 
 
 def test_eval_case_accepts_critical_and_rejected_values() -> None:

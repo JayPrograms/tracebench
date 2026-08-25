@@ -788,6 +788,39 @@ END
     """,
 )
 
+_LEGACY_REFERENCE_ONLY_PROVENANCE_CONDITION = """case_row.evaluation_mode = 'reference'
+          AND case_row.source_response IS NOT NULL
+          AND case_row.reference_answer = case_row.source_response
+          AND json_array_length(case_row.rubric_json) = 0
+          AND json_array_length(case_row.scorers_json) = 0
+          AND case_row.priority = 'medium'
+          AND case_row.review_status = 'draft'"""
+
+_MIXED_MODE_PROVENANCE_CONDITION = """(
+              (
+                  case_row.evaluation_mode = 'reference'
+                  AND case_row.source_response IS NOT NULL
+                  AND case_row.reference_answer = case_row.source_response
+                  AND json_array_length(case_row.rubric_json) = 0
+                  AND json_array_length(case_row.scorers_json) = 0
+              )
+              OR (
+                  case_row.evaluation_mode = 'deterministic'
+                  AND case_row.source_response IS NULL
+                  AND case_row.reference_answer IS NULL
+                  AND json_array_length(case_row.rubric_json) = 0
+                  AND json_array_length(case_row.scorers_json) > 0
+              )
+              OR (
+                  case_row.evaluation_mode = 'rubric'
+                  AND case_row.source_response IS NULL
+                  AND case_row.reference_answer IS NULL
+                  AND json_array_length(case_row.rubric_json) > 0
+                  AND json_array_length(case_row.scorers_json) = 0
+              )
+          )"""
+
+
 B2_TRIGGER_STATEMENTS = (
     """
 CREATE TRIGGER IF NOT EXISTS prevent_slice_built_dataset_update
@@ -844,7 +877,7 @@ BEGIN
     SELECT RAISE(ABORT, 'slice-built datasets are sealed');
 END
 """,
-    """
+    f"""
 CREATE TRIGGER IF NOT EXISTS validate_case_slice_provenance_insert
 BEFORE INSERT ON eval_case_slice_provenance
 BEGIN
@@ -863,13 +896,7 @@ BEGIN
           AND case_row.dataset_id = NEW.dataset_id
           AND case_row.source_trace_id = NEW.source_trace_id
           AND case_row.source_timestamp = NEW.source_timestamp
-          AND case_row.evaluation_mode = 'reference'
-          AND case_row.source_response IS NOT NULL
-          AND case_row.reference_answer = case_row.source_response
-          AND json_array_length(case_row.rubric_json) = 0
-          AND json_array_length(case_row.scorers_json) = 0
-          AND case_row.priority = 'medium'
-          AND case_row.review_status = 'draft'
+          AND {_MIXED_MODE_PROVENANCE_CONDITION}
           AND run.name = NEW.clustering_run_name
           AND run.schema_version = NEW.clustering_schema_version
           AND run.configuration_hash = NEW.clustering_configuration_hash
@@ -1381,6 +1408,7 @@ def connect_database(database_path: Path) -> sqlite3.Connection:
             connection.execute(statement)
         _ensure_eval_schema_compatible(connection)
         _migrate_experiment_schema(connection)
+        _migrate_reference_only_provenance_trigger(connection)
         for statement in (
             *EVAL_CASE_TRIGGER_STATEMENTS,
             *B2_TRIGGER_STATEMENTS,
@@ -1449,6 +1477,39 @@ def _ensure_b2_schema_absent_or_complete(connection: sqlite3.Connection) -> None
             "slice-aware B2 schema is partial or incompatible; recreate the B2 "
             "schema objects"
         )
+
+
+def _migrate_reference_only_provenance_trigger(
+    connection: sqlite3.Connection,
+) -> None:
+    """Replace only the known B2 reference-only provenance trigger."""
+    trigger_name = "validate_case_slice_provenance_insert"
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+        (trigger_name,),
+    ).fetchone()
+    if row is None:
+        return
+    current_statement = next(
+        statement
+        for statement in B2_TRIGGER_STATEMENTS
+        if f"CREATE TRIGGER IF NOT EXISTS {trigger_name}" in statement
+    ).lstrip()
+    current_sql = _normalize_schema_sql(
+        current_statement.replace("CREATE TRIGGER IF NOT EXISTS", "CREATE TRIGGER", 1)
+    )
+    actual_sql = _normalize_schema_sql(row["sql"])
+    if actual_sql == current_sql:
+        return
+    legacy_sql = _normalize_schema_sql(
+        current_statement.replace(
+            _MIXED_MODE_PROVENANCE_CONDITION,
+            _LEGACY_REFERENCE_ONLY_PROVENANCE_CONDITION,
+            1,
+        ).replace("CREATE TRIGGER IF NOT EXISTS", "CREATE TRIGGER", 1)
+    )
+    if actual_sql == legacy_sql:
+        connection.execute(f'DROP TRIGGER "{trigger_name}"')
 
 
 def _ensure_b2_schema_compatible(connection: sqlite3.Connection) -> None:

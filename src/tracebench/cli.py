@@ -46,6 +46,7 @@ from tracebench.models import (
     ScorerConfig,
     Trace,
 )
+from tracebench.reporting import ExperimentDetailError, export_experiment_detail
 from tracebench.storage import (
     connect_database,
     list_traces,
@@ -238,8 +239,19 @@ def build_eval_dataset(
         typer.Option("--from-slices", help="Immutable clustering run name."),
     ],
     size: Annotated[int, typer.Option(min=1, help="Exact number of evaluation cases.")],
+    case_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--case-file",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            help="Optional strict schema-v1 JSON overrides for selected cases.",
+        ),
+    ] = None,
 ) -> None:
-    """Build an exact-size balanced reference dataset from numeric slices."""
+    """Build an exact-size balanced dataset from numeric slices."""
     try:
         result = build_dataset_from_slices(
             resolve_database_path(),
@@ -247,6 +259,7 @@ def build_eval_dataset(
             version=version,
             clustering_run_name=from_slices,
             size=size,
+            case_file=case_file,
         )
     except DatasetBuildValidationError as error:
         typer.echo(f"Error: {error}; no dataset was persisted", err=True)
@@ -478,6 +491,27 @@ def run_experiment_command(
         _print_experiment_report(report)
     if report.verdict is ExperimentVerdict.FAIL:
         raise typer.Exit(code=1)
+
+
+@experiment_app.command("export")
+def export_experiment_command(
+    experiment_id: Annotated[str, typer.Argument(help="Persisted experiment ID.")],
+    output: Annotated[Path, typer.Option(help="Destination UTF-8 JSON detail file.")],
+    overwrite: Annotated[
+        bool, typer.Option(help="Replace an existing output file.")
+    ] = False,
+) -> None:
+    """Export a persisted experiment detail for dashboards and automation."""
+    try:
+        export_experiment_detail(
+            resolve_database_path(),
+            experiment_id,
+            output,
+            overwrite=overwrite,
+        )
+    except (ExperimentDetailError, OSError, sqlite3.Error, ValueError) as error:
+        _exit_experiment_export_error(error)
+    typer.echo(f"Exported experiment detail {experiment_id} to {output}.")
 
 
 def _print_ingestion_summary(summary: IngestionSummary) -> None:
@@ -777,6 +811,12 @@ def _exit_dataset_error(error: BaseException) -> Never:
 def _exit_clustering_error(error: BaseException) -> Never:
     typer.echo(f"Error: {error}", err=True)
     raise typer.Exit(code=1) from error
+
+
+def _exit_experiment_export_error(error: BaseException) -> Never:
+    """Render export IDs and paths as usage/preflight failures."""
+    typer.echo(f"Error: {error}", err=True)
+    raise typer.Exit(code=2) from error
 
 
 def _exit_usage_error(message: str) -> Never:

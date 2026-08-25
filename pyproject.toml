@@ -23,6 +23,9 @@ dev = [
     "ruff>=0.8,<1",
     "types-PyYAML>=6,<7",
 ]
+dashboard = [
+    "streamlit>=1.40,<2",
+]
 
 [project.scripts]
 tracebench = "tracebench.cli:app"

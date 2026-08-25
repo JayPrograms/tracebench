@@ -15,7 +15,9 @@ from tracebench.datasets import (
     DatasetBuildValidationError,
     build_dataset_from_slices,
     create_dataset,
+    export_dataset,
     get_dataset_details,
+    load_slice_case_file,
     promote_trace,
 )
 from tracebench.experiment_config import ExperimentPreflightError, prepare_experiment
@@ -122,6 +124,270 @@ def test_slice_build_is_exact_balanced_reproducible_and_sealed(tmp_path: Path) -
             mode=EvaluationMode.REFERENCE,
             use_source_response=True,
         )
+
+
+def test_slice_sampling_is_reproducible_across_independent_clustering_runs(
+    tmp_path: Path,
+) -> None:
+    results = []
+    for database_name in ("first.sqlite3", "second.sqlite3"):
+        database_path = tmp_path / database_name
+        _store_traces(database_path)
+        clustered = create_clustering_run(
+            database_path, name="independent-slices", clusters=3
+        )
+        rename_slice(database_path, "independent-slices", 0, "refunds")
+        built = build_dataset_from_slices(
+            database_path,
+            name="independent-eval",
+            version="1",
+            clustering_run_name="independent-slices",
+            size=4,
+        )
+        results.append((clustered, built))
+
+    first_clustered, first = results[0]
+    second_clustered, second = results[1]
+    assert (
+        first_clustered.run.clustering_run_id != second_clustered.run.clustering_run_id
+    )
+    assert [case.source_trace_id for case in first.cases] == [
+        case.source_trace_id for case in second.cases
+    ]
+    assert (
+        first.slice_source.slice_manifest_hash
+        == second.slice_source.slice_manifest_hash
+    )
+    assert first.slice_source.slice_manifest == second.slice_source.slice_manifest
+    assert [case.slice_provenance.selection_key for case in first.cases] == [
+        case.slice_provenance.selection_key for case in second.cases
+    ]
+
+
+def test_case_file_builds_mixed_modes_with_provenance_and_no_answer_leak(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "mixed.sqlite3"
+    _store_traces(database_path)
+    create_clustering_run(database_path, name="mixed-slices", clusters=3)
+    preview = build_dataset_from_slices(
+        database_path,
+        name="preview",
+        version="1",
+        clustering_run_name="mixed-slices",
+        size=4,
+    )
+    selected_ids = [case.source_trace_id for case in preview.cases]
+    case_file = tmp_path / "cases.json"
+    case_file.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "cases": [
+                    {
+                        "source_trace_id": selected_ids[0],
+                        "mode": "deterministic",
+                        "scorers": [
+                            {
+                                "name": "contains",
+                                "config": {"substring": "answer"},
+                            }
+                        ],
+                        "priority": "high",
+                    },
+                    {
+                        "source_trace_id": selected_ids[1],
+                        "mode": "rubric",
+                        "rubric": ["The answer follows support policy."],
+                        "priority": "critical",
+                        "review_status": "approved",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    built = build_dataset_from_slices(
+        database_path,
+        name="mixed",
+        version="1",
+        clustering_run_name="mixed-slices",
+        size=4,
+        case_file=case_file,
+    )
+
+    by_id = {case.source_trace_id: case for case in built.cases}
+    assert {case.evaluation_mode for case in built.cases} == set(EvaluationMode)
+    assert by_id[selected_ids[0]].evaluation_mode is EvaluationMode.DETERMINISTIC
+    assert by_id[selected_ids[0]].source_response is None
+    assert by_id[selected_ids[0]].reference_answer is None
+    assert by_id[selected_ids[0]].priority is Priority.HIGH
+    assert by_id[selected_ids[1]].evaluation_mode is EvaluationMode.RUBRIC
+    assert by_id[selected_ids[1]].source_response is None
+    assert by_id[selected_ids[1]].reference_answer is None
+    assert by_id[selected_ids[1]].priority is Priority.CRITICAL
+    assert all(case.slice_provenance is not None for case in built.cases)
+    reference_cases = [
+        case for case in built.cases if case.evaluation_mode is EvaluationMode.REFERENCE
+    ]
+    assert len(reference_cases) == 2
+    assert all(
+        case.source_response == case.reference_answer for case in reference_cases
+    )
+
+    export_path = tmp_path / "mixed.jsonl"
+    export_dataset(database_path, "mixed:1", export_path)
+    exported_cases = [
+        json.loads(line)["case"]
+        for line in export_path.read_text(encoding="utf-8").splitlines()[1:]
+    ]
+    nonreference = [
+        case for case in exported_cases if case["evaluation_mode"] != "reference"
+    ]
+    assert all(case["source_response"] is None for case in nonreference)
+    assert all(case["reference_answer"] is None for case in nonreference)
+
+    with pytest.raises(sqlite3.IntegrityError, match="sealed"):
+        promote_trace(
+            database_path,
+            dataset_reference="mixed:1",
+            trace_id="trace-5",
+            mode=EvaluationMode.REFERENCE,
+            use_source_response=True,
+        )
+
+
+def test_unselected_case_file_override_rolls_back_every_dataset_row(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "unselected.sqlite3"
+    _store_traces(database_path)
+    create_clustering_run(database_path, name="unselected-slices", clusters=3)
+    preview = build_dataset_from_slices(
+        database_path,
+        name="preview",
+        version="1",
+        clustering_run_name="unselected-slices",
+        size=3,
+    )
+    selected_ids = {case.source_trace_id for case in preview.cases}
+    unselected_id = next(
+        f"trace-{index}" for index in range(6) if f"trace-{index}" not in selected_ids
+    )
+    case_file = tmp_path / "unselected.json"
+    case_file.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "cases": [{"source_trace_id": unselected_id, "mode": "reference"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DatasetBuildValidationError, match="not selected by sampling"):
+        build_dataset_from_slices(
+            database_path,
+            name="must-rollback",
+            version="1",
+            clustering_run_name="unselected-slices",
+            size=3,
+            case_file=case_file,
+        )
+
+    with closing(connect_database(database_path)) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM eval_datasets WHERE name = 'must-rollback'"
+            ).fetchone()[0]
+            == 0
+        )
+
+
+@pytest.mark.parametrize(
+    ("contents", "message"),
+    [
+        ('{"schema_version":1,"schema_version":1,"cases":[]}', "duplicate JSON key"),
+        ('{"schema_version":2,"cases":[]}', "Input should be 1"),
+        ('{"schema_version":1,"cases":[],"extra":true}', "Extra inputs"),
+        (
+            '{"schema_version":1,"cases":[{"source_trace_id":"x","mode":"rubric"}]}',
+            "requires at least one rubric",
+        ),
+        (
+            '{"schema_version":1,"cases":[{"source_trace_id":"x","mode":"reference","score":NaN}]}',
+            "non-finite number",
+        ),
+    ],
+)
+def test_case_file_parser_is_strict(
+    tmp_path: Path, contents: str, message: str
+) -> None:
+    case_file = tmp_path / "cases.json"
+    case_file.write_text(contents, encoding="utf-8")
+
+    with pytest.raises(DatasetBuildValidationError, match=message):
+        load_slice_case_file(case_file)
+
+
+def test_reference_only_provenance_trigger_migrates_for_mixed_cases(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "trigger-migration.sqlite3"
+    _store_traces(database_path)
+    create_clustering_run(database_path, name="migration-slices", clusters=3)
+    preview = build_dataset_from_slices(
+        database_path,
+        name="preview",
+        version="1",
+        clustering_run_name="migration-slices",
+        size=3,
+    )
+    selected_id = preview.cases[0].source_trace_id
+    current_statement = next(
+        statement
+        for statement in storage_module.B2_TRIGGER_STATEMENTS
+        if "validate_case_slice_provenance_insert" in statement
+    )
+    legacy_statement = current_statement.replace(
+        storage_module._MIXED_MODE_PROVENANCE_CONDITION,
+        storage_module._LEGACY_REFERENCE_ONLY_PROVENANCE_CONDITION,
+    )
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.execute("DROP TRIGGER validate_case_slice_provenance_insert")
+        connection.execute(legacy_statement)
+
+    case_file = tmp_path / "migration-cases.json"
+    case_file.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "cases": [
+                    {
+                        "source_trace_id": selected_id,
+                        "mode": "rubric",
+                        "rubric": ["The response is correct."],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    built = build_dataset_from_slices(
+        database_path,
+        name="migrated",
+        version="1",
+        clustering_run_name="migration-slices",
+        size=3,
+        case_file=case_file,
+    )
+
+    migrated_case = next(
+        case for case in built.cases if case.source_trace_id == selected_id
+    )
+    assert migrated_case.evaluation_mode is EvaluationMode.RUBRIC
+    assert migrated_case.slice_provenance is not None
 
 
 def test_slice_build_shortfall_rolls_back_every_dataset_row(tmp_path: Path) -> None:
