@@ -109,5 +109,6 @@ decision.
 export deliberately excludes raw judge attempts, malformed responses,
 system-prompt contents, and credential-like metadata, but it can still contain
 customer prompts, contexts, outputs, and reference answers. Treat it as sensitive
-trace data. See the [demo recording package](demo-script.md) for the proposed
-hosted delivery path; no hosted service is part of this checkpoint.
+trace data. See the [demo recording package](demo-script.md) for the hosted
+delivery notes. The public dashboard is a read-only synthetic preview; it is
+not a hosted evaluation service.
