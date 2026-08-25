@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 from typing import Any
 
 import streamlit as st
@@ -32,6 +33,14 @@ from tracebench.dashboard import (
 from tracebench.experiment_models import ComparisonTransition, JudgeReviewStatus
 from tracebench.models import EvaluationMode, Priority
 from tracebench.reporting import CaseDetail, ExperimentDetail
+
+HOSTED_DEMO_REPORT = (
+    Path(__file__).resolve().parents[1]
+    / "demos"
+    / "customer-support"
+    / "hosted"
+    / "northstar-fail-detail.json"
+)
 
 
 def main() -> None:
@@ -79,6 +88,12 @@ def _load_from_ui() -> tuple[ExperimentDetail | None, str]:
             _render_load_error(error)
             return None, uploaded.name
     if selected_path is None:
+        if HOSTED_DEMO_REPORT.is_file():
+            try:
+                return load_detail_file(HOSTED_DEMO_REPORT), "Northstar hosted demo"
+            except DashboardLoadError as error:
+                _render_load_error(error)
+                return None, "Northstar hosted demo"
         return None, ""
     try:
         return load_detail_file(selected_path), selected_path.name

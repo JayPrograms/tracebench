@@ -219,9 +219,14 @@ def test_streamlit_smoke_renders_empty_invalid_and_valid_states(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("TRACEBENCH_REPORT_PATH", raising=False)
-    empty = AppTest.from_file(str(APP_PATH), default_timeout=30).run()
-    assert empty.info
-    assert empty.title[0].value == "TraceBench result explorer"
+    default_demo = AppTest.from_file(str(APP_PATH), default_timeout=30).run()
+    assert default_demo.success
+    assert default_demo.title[0].value == "TraceBench result explorer"
+    assert any("Northstar hosted demo" in item.value for item in default_demo.success)
+    assert any("FAIL" in item.value for item in default_demo.error)
+    assert any(
+        "Unavailable for fixture providers" in item.value for item in default_demo.info
+    )
 
     invalid_path = tmp_path / "invalid.json"
     invalid_path.write_text("{}", encoding="utf-8")

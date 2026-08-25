@@ -95,7 +95,29 @@ are displayed without opening the database or re-running evaluation. Fixture
 latency is shown as unavailable because it is not representative. Raw judge
 attempts and prompts are intentionally absent from the detail export. Exports
 may contain sensitive support data, so keep them private. Hosted deployment and
-authentication are deferred.
+authentication are not required for the reviewed hosted snapshot.
+
+## Reviewed hosted snapshot
+
+The default hosted configuration loads the reviewed hosted snapshot at
+`demos/customer-support/hosted/northstar-fail-detail.json`. It contains only
+synthetic Northstar data, validates as schema-version-1 `ExperimentDetail`, and
+shows the intentional `FAIL` scenario without opening SQLite or running models.
+The snapshot is versioned as an auditable fixture; it is not a general report
+directory.
+
+To intentionally regenerate a replacement for review, always provide an
+explicit output path and inspect the result before replacing the reviewed file:
+
+```powershell
+python scripts/prepare_customer_support_dashboard.py `
+  --output .tracebench/reviewed-northstar-detail.json
+```
+
+The command never overwrites an existing file unless `--overwrite` is supplied.
+Do not use `--overwrite` against the reviewed hosted snapshot casually. Local
+exports may contain sensitive support prompts, contexts, outputs, and reference
+answers; the hosted snapshot contains synthetic data only.
 
 The bootstrap script is a thin cross-platform wrapper around the real
 TraceBench CLI. It ingests the checked-in traces, clusters them, applies the

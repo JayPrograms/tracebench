@@ -36,6 +36,7 @@
 - Do not require hosted or paid services.
 - Do not add authentication, distributed workers, cloud infrastructure, vector databases, a dashboard, or unrelated refactors.
 - Never commit secrets, `.env` files, `.venv`, SQLite databases, caches, model files, or generated reports.
+- Narrow reviewed-fixture exception: `demos/customer-support/hosted/northstar-fail-detail.json` is the one allowed versioned hosted-demo snapshot. It contains only synthetic Northstar data and exists so the hosted read-only dashboard can start from a stable, auditable `ExperimentDetail` without running models or evaluation jobs. Do not add local reports, arbitrary exports, production trace exports, or generated dashboard state under this exception.
 
 ## Before finishing
 
