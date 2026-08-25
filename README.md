@@ -1,374 +1,59 @@
 # TraceBench
 
-TraceBench is a local-first regression-testing tool for LLM applications. It turns application traces into versioned evaluation datasets, compares baseline and candidate model or prompt configurations, scores their outputs, and blocks releases when quality regresses.
+Local-first regression testing for LLM applications.
 
-## The problem
+[![CI](https://github.com/JayPrograms/tracebench/actions/workflows/ci.yml/badge.svg)](https://github.com/JayPrograms/tracebench/actions/workflows/ci.yml)
+[![Evaluation Gate](https://github.com/JayPrograms/tracebench/actions/workflows/eval-gate.yml/badge.svg)](https://github.com/JayPrograms/tracebench/actions/workflows/eval-gate.yml)
 
-Changes to models, prompts, and application logic can silently reduce output quality. Reproducing real interactions, comparing configurations consistently, and deciding whether a release is safe often requires custom tooling or paid hosted services. TraceBench aims to make that workflow repeatable, version-controlled, and runnable on a developer's machine.
+TraceBench compares a baseline and candidate model, prompt, or application
+configuration; scores their answers with reference, deterministic, and rubric
+evaluations; and blocks a release when configured regression thresholds fail.
+Checked-in fixtures make CI deterministic, and an optional Ollama provider enables
+local-model experiments. No paid service is required.
 
-## Planned V0.1 workflow
+## Why TraceBench?
 
-1. Import application traces into a local, versioned evaluation dataset.
-2. Define baseline and candidate model or prompt configurations.
-3. Run both configurations against the same dataset.
-4. Score and compare their outputs.
-5. Produce a regression report and return a failing exit code when configured quality thresholds are not met.
+LLM changes can improve one behavior while silently breaking another. Teams need
+to replay representative interactions, preserve exactly what was evaluated, see
+which slices regressed, and make the release decision reproducible. TraceBench
+keeps that control loop in a local SQLite database with strict schemas, immutable
+provenance, and a machine-readable gate result.
 
-TraceBench is local-first and designed to work without paid services.
+## Demo
 
-## Development status
+The [Northstar Shop customer-support benchmark](demos/customer-support/README.md)
+is a complete, reproducible product story:
 
-TraceBench supports importing application traces, promoting selected traces into
-versioned evaluation datasets, and running persisted baseline-versus-candidate
-experiments with deterministic regression gates, rubric judging, immutable judge
-result caching, and human-review escalation metadata.
+- 35 production-like support traces are clustered into seven behavioral slices.
+- A sealed dataset contains 21 cases: seven reference, seven deterministic, and
+  seven rubric cases.
+- The showcase candidate improves delivery and troubleshooting answers but
+  introduces plausible billing, cancellation, and refund regressions.
+- The critical refund-policy failure escalates to review, while a low-confidence
+  account-security judgment also enters the review queue.
+- The final comparison is `FAIL` with baseline score `0.933333`, candidate score
+  `0.900000`, two newly passed cases, three newly failed cases, and one critical
+  regression.
 
-## Trace ingestion
+The intentionally failing fixture is the story users inspect locally. GitHub
+Actions uses a separate CI-safe candidate and judge fixture that preserves the
+improvements without regressions; that release gate returns `PASS` and exit `0`.
+The showcase run returns exit `1` twice, and the second run reuses immutable judge
+cache entries. Fixture latency is not presented as representative performance.
 
-Import newline-delimited JSON traces from the repository's sample dataset:
+## Dashboard
 
-```powershell
-tracebench ingest datasets/traces.sample.jsonl
-```
+The optional Streamlit result explorer consumes only a strict,
+versioned `ExperimentDetail` JSON export. It is read-only: it does not open
+SQLite, rescore cases, apply thresholds, or duplicate evaluation logic.
 
-Each input line must contain one JSON trace object. Invalid records are reported
-with their line numbers and skipped, while valid records continue to be stored.
-Duplicate `trace_id` values are also skipped. The command prints:
+![Northstar release overview](docs/images/dashboard-overview.png)
 
-```text
-Records read: N
-Records accepted: N
-Invalid records: N
-Duplicates skipped: N
-Records stored: N
-```
+![Regression explorer](docs/images/dashboard-regression.png)
 
-List stored traces in newest-first order:
+![Review queue](docs/images/dashboard-review-queue.png)
 
-```powershell
-tracebench traces list
-```
-
-## Reproducible trace clustering and named slices
-
-Create an immutable, version-named clustering run over the current trace snapshot:
-
-```powershell
-tracebench traces cluster --name support-slices-v1 --clusters 6
-```
-
-The default document is the stored prompt exactly as ingested. Add
-`--include-context` to use a fixed prompt/context format containing canonical
-context JSON, or `--svd-components N` to enable the optional dimensionality
-reduction step. TraceBench requires the configured SVD dimension to satisfy
-`1 <= N < min(trace count, TF-IDF feature count)`.
-
-List the resulting numeric slices and assign a human-readable label:
-
-```powershell
-tracebench slices list support-slices-v1
-tracebench slices rename support-slices-v1 0 refunds
-```
-
-Run names, configurations, source provenance, and trace assignments are immutable.
-Labels are editable metadata and are unique within a run after Unicode NFKC
-normalization and case folding. Clustering uses deterministic trace ordering and
-fixed random seeds. The configuration identity records exact TraceBench,
-scikit-learn, NumPy, and SciPy versions; assignment equivalence is not promised
-across dependency versions, platforms, or numerical runtimes.
-
-## Versioned evaluation datasets
-
-Build an exact-size reference dataset directly from an immutable clustering run:
-
-```powershell
-tracebench dataset build `
-  --name support-eval `
-  --version 0.2 `
-  --from-slices support-slices-v1 `
-  --size 30
-```
-
-The builder considers only assigned traces with nonblank source responses. It
-allocates cases as evenly as possible across numeric clusters using deterministic
-round-robin quotas. Within each slice it first prefers traces with persisted
-critical evaluation-case priority or a failed case result from a completed prior
-experiment, treating the two signals equally, and then uses a stable SHA-256
-rank. Selected cases snapshot both signals and their derived preference tier.
-Unvalidated trace metadata never acts as priority. The requested size is exact:
-insufficient eligible traces fail without creating a dataset. Generated cases
-are reference-mode, medium-priority drafts whose exact source responses are
-snapshotted as reference answers. No LLM participates in sampling.
-
-Add an optional strict schema-version-`1` JSON case file to override selected
-traces as deterministic, reference, or rubric cases before the dataset is sealed:
-
-```powershell
-tracebench dataset build `
-  --name support-eval `
-  --version 0.2 `
-  --from-slices support-slices-v1 `
-  --size 30 `
-  --case-file demos/customer-support/cases.json
-```
-
-Case-file entries may refer only to traces chosen by deterministic sampling.
-Selected traces omitted from the file remain reference cases. Invalid JSON,
-duplicate keys or trace definitions, unsupported schema versions, mode-invalid
-configuration, and unselected trace overrides fail atomically. Deterministic and
-rubric cases omit source responses and reference answers.
-
-Numeric selectors such as `cluster-0` are authoritative. Labels are optional and
-are snapshotted when the dataset is built, so later `slices rename` operations do
-not change existing datasets, exports, experiment reports, or gate resolution.
-Slice-built datasets are sealed and cannot receive later `dataset add-trace`
-promotions.
-
-Sampling rank and allocation identities use the immutable clustering
-configuration and source-manifest hashes rather than the random clustering-run
-identifier. Independent runs over the same trace snapshot therefore select the
-same cases while retaining distinct run provenance.
-
-## Customer-support product demo
-
-The [Northstar Shop demo](demos/customer-support/README.md) provides 35 traces,
-seven named slices, a mixed-mode 21-case dataset, deterministic baseline,
-candidate, and judge fixtures, an intentional failed release gate, judge-cache
-reuse, and an optional Ollama-compatible configuration.
-
-The repository's `CI` workflow runs formatting, linting, type checking, and the
-full test suite. The separate `Evaluation gate` workflow uses only checked-in
-fixtures: it bootstraps a fresh 35-trace database, builds the exact 21-case
-dataset, and runs `experiment.ci-pass.yaml`. That candidate preserves the demo
-improvements without regressions, so a completed `PASS` returns exit `0`.
-The intentionally regressing `experiment.fixture.yaml` remains a local
-showcase and returns exit `1`; it is not the normal CI gate. Both workflows use
-`.github/constraints-ci.txt` to keep the numerical clustering stack aligned
-with the frozen sampling manifest.
-
-Create an independent dataset version:
-
-```powershell
-tracebench dataset create `
-  --name support-eval `
-  --version 0.1 `
-  --description "Customer support regression benchmark"
-```
-
-List datasets and their case counts:
-
-```powershell
-tracebench dataset list
-```
-
-Promote a stored trace. Dataset references use `name:version`. Reference mode
-requires either an explicit `--reference-answer` or the
-`--use-source-response` flag:
-
-```powershell
-tracebench dataset add-trace `
-  --dataset support-eval:0.1 `
-  --trace-id sample-001 `
-  --mode reference `
-  --use-source-response
-```
-
-Deterministic mode requires one or more scorer configurations. The core experiment
-loop validates and executes the built-in configurations:
-
-```powershell
-tracebench dataset add-trace `
-  --dataset support-eval:0.1 `
-  --trace-id sample-002 `
-  --mode deterministic `
-  --scorer-file datasets/scorer.exact-match.json `
-  --priority high
-```
-
-Scorer files avoid native-command JSON quoting differences across Windows
-PowerShell versions. Each file contains one scorer JSON object; repeat
-`--scorer-file` for additional configurations. The inline `--scorer` option
-remains available for callers that already have a correctly tokenized JSON
-argument. Scorer files may be UTF-8 with or without the byte-order mark emitted
-by Windows PowerShell.
-
-Rubric mode accepts one or more criteria through repeated options:
-
-```powershell
-tracebench dataset add-trace `
-  --dataset support-eval:0.1 `
-  --trace-id sample-003 `
-  --mode rubric `
-  --rubric "The answer is factually correct." `
-  --rubric "The answer directly addresses the request."
-```
-
-New cases default to `medium` priority and `draft` review status. The available
-priorities are `low`, `medium`, `high`, and `critical`; review statuses are
-`draft`, `approved`, and `rejected`.
-
-Inspect or export the resulting dataset:
-
-```powershell
-tracebench dataset show support-eval:0.1
-tracebench dataset export `
-  support-eval:0.1 `
-  --output datasets/support-eval-v0.1.jsonl
-```
-
-Exports use JSONL envelopes. The first line is always a `dataset` metadata
-record, including for an empty dataset. Each following line is an `eval_case`
-record. Cases contain a snapshot of the source trace ID, timestamp, task type,
-metadata, prompt, and context, so the export remains auditable without the
-SQLite database. Reference cases also retain the source response when one was
-available; deterministic and rubric cases omit it to prevent answer leakage.
-An existing export is protected unless `--overwrite` is explicitly supplied.
-
-Dataset and evaluation-case IDs are stable UUID5 values. Dataset IDs are
-derived from the trimmed dataset name and version under a fixed namespace;
-case IDs are derived from that stable dataset ID and the source trace ID under
-a second fixed namespace. Rebuilding the same logical dataset therefore
-reproduces the same IDs without relying on Python's process-randomized
-`hash()`.
-
-Databases containing only traces are initialized with the evaluation schema
-automatically. Development databases created by the earlier, unmerged
-evaluation-dataset implementation must be recreated because they contain
-random IDs and lack the provenance columns and final integrity constraints.
-TraceBench reports this incompatibility when opening such a database; reingest
-the original trace JSONL and recreate its datasets in a new database.
-
-## Core evaluation loop
-
-The checked-in sample demonstrates the complete workflow. Start with a fresh local
-database, ingest the traces, and create the versioned dataset used by the sample
-experiment:
-
-```powershell
-$env:TRACEBENCH_DB_PATH = ".tracebench/core-loop.sqlite3"
-tracebench ingest datasets/traces.sample.jsonl
-tracebench dataset create `
-  --name core-eval `
-  --version 0.1 `
-  --description "Core evaluation-loop sample"
-```
-
-Promote the three traces with all five deterministic scorer types:
-
-```powershell
-tracebench dataset add-trace `
-  --dataset core-eval:0.1 `
-  --trace-id sample-001 `
-  --mode deterministic `
-  --scorer-file datasets/scorer.exact-match.json `
-  --scorer-file datasets/scorer.contains.json
-
-tracebench dataset add-trace `
-  --dataset core-eval:0.1 `
-  --trace-id sample-002 `
-  --mode deterministic `
-  --scorer-file datasets/scorer.regex.json
-
-tracebench dataset add-trace `
-  --dataset core-eval:0.1 `
-  --trace-id sample-003 `
-  --mode deterministic `
-  --scorer-file datasets/scorer.json-validity.json `
-  --scorer-file datasets/scorer.required-keys.json
-```
-
-Run the baseline and candidate fixtures, score both, compare them globally and by
-evaluation mode, and apply the configured regression gate:
-
-```powershell
-tracebench experiment run datasets/core-evaluation.sample.yaml
-```
-
-The sample baseline fails the `required_keys` scorer for one case, while the
-candidate fixes it without introducing a failure, so the command prints `PASS` and
-exits `0`. Use `--json` for a stable machine-readable result:
-
-```powershell
-tracebench experiment run datasets/core-evaluation.sample.yaml --json
-$LASTEXITCODE
-```
-
-Each fixture is UTF-8 JSONL with exactly one strict record per evaluation case:
-
-```json
-{"eval_id":"eval_...","output":"provider output, which may be empty"}
-```
-
-Duplicate, missing, or unknown evaluation IDs are rejected before an experiment
-attempt is created. Fixture paths in YAML are relative to the configuration file.
-The supported scorer configurations are:
-
-- `exact_match`: `expected` and optional `case_sensitive` (default `true`)
-- `contains`: nonblank `substring` and optional `case_sensitive`
-- `regex`: compilable `pattern` and optional `case_sensitive`; matching uses search
-  semantics
-- `json_validity`: an empty configuration and strict standard-JSON parsing
-- `required_keys`: a nonempty, unique list of required top-level JSON object `keys`
-
-Reference-mode cases use implicit case-sensitive exact matching against their
-reference answer. Rubric cases are evaluated by the experiment's configured judge
-provider, described below.
-
-The YAML gate defaults to zero allowed global score drop and zero newly failed
-cases. Optional `by_mode` entries may override either limit and inherit the other
-global value. An override must name a supported mode present in the dataset.
-Absent modes are omitted from results rather than represented with zero or `NaN`.
-
-Slice-built datasets also support strict label or numeric-selector overrides:
-
-```yaml
-gate:
-  max_score_drop: 0.03
-  max_new_failures: 1
-  by_slice:
-    refunds:
-      max_score_drop: 0.0
-      max_new_failures: 0
-```
-
-Each configured slice inherits omitted limits from the global gate. Missing,
-ambiguous, duplicate, or unrepresented selectors fail preflight without creating
-an experiment attempt. Unlisted slices are still aggregated and reported but do
-not receive an independent slice gate. Gate comparisons use unrounded values and
-pass at exact threshold equality.
-
-Completed experiments on slice-built datasets emit machine-readable report schema
-version `2`, including `dataset.slice_source`, per-run `by_slice` aggregates, and
-comparison `by_slice` transitions. Experiments on ordinary datasets continue to
-emit the unchanged schema-version-`1` shape. Human reports add a numeric-order
-slice table only for slice-aware experiments.
-
-Export a read-only, dashboard-ready detail document for a persisted attempt. The
-experiment ID is available from the stable `--json` output even when the gate
-returns exit `1`:
-
-```powershell
-$result = tracebench experiment run demos/customer-support/experiment.fixture.yaml --json
-$result | Set-Content .tracebench/last-report.json
-$experimentId = ($result | ConvertFrom-Json).experiment_id
-tracebench experiment export $experimentId --output .tracebench/experiment-detail.json
-```
-
-The detail export is versioned JSON and joins the authoritative report with
-dataset cases, slice provenance, provider snapshots, run lifecycle metadata,
-generation observations, and baseline/candidate case rows. It is deterministic,
-read-only, finite-number JSON, and protects an existing destination unless
-`--overwrite` is supplied. It intentionally omits raw judge attempts, malformed
-responses, authentication-like values, and system-prompt contents. Case inputs,
-contexts, outputs, and reference answers may contain sensitive customer-support
-data; treat exports as sensitive trace artifacts and do not commit them. The
-machine report is the compact release-gate contract; the detail export is the
-future dashboard's richer inspection document.
-
-## Local result explorer
-
-Install the optional dashboard extra when you want the read-only Streamlit
-explorer; the core package and CI-safe fixture workflow do not require it:
+Prepare a fresh failing export and launch it locally:
 
 ```powershell
 python -m pip install -e ".[dev,dashboard]"
@@ -377,233 +62,271 @@ python scripts/prepare_customer_support_dashboard.py `
 streamlit run dashboard/app.py
 ```
 
-The preparation script builds a fresh Northstar database through the public
-CLI, runs the intentional failing fixture, exports the strict
-`ExperimentDetail` document, and validates its `FAIL` verdict. It uses a
-temporary database unless `--database` is supplied; no generated database or
-report belongs in version control. The app also accepts
-`TRACEBENCH_REPORT_PATH` or `streamlit run dashboard/app.py -- --report path`.
-An uploaded JSON file must validate against the supported detail schema; empty,
-invalid, unsupported-version, and unreadable states are explained in the UI.
+The app also accepts `TRACEBENCH_REPORT_PATH`, `-- --report path`, or a JSON
+upload. Treat exports as sensitive trace artifacts: they can contain prompts,
+contexts, outputs, and reference answers. Hosted deployment and authentication
+are intentionally deferred; see [Hosted dashboard strategy](docs/demo-script.md#hosted-dashboard-strategy).
 
-The explorer never queries SQLite, rescores, recalculates, applies thresholds,
-changes persisted verdicts, or writes data. Scores, transitions, slice rows,
-gate violations, review reasons, and latency observations are read from the
-export. Fixture-provider latency is explicitly shown as unavailable because
-fixture timing is not representative. Detail exports can contain customer
-prompts, contexts, outputs, and reference answers; treat them as sensitive and
-keep them private. Hosted deployment and authentication are intentionally
-deferred to a later checkpoint.
+## How it works
 
-Every successful preflight creates a new experiment attempt. Names are reusable
-labels, so rerunning the same name never overwrites or resumes an earlier attempt.
-Every attempt receives a new ID; behaviorally identical dataset definitions,
-fixtures, scorers, and thresholds receive the same deterministic configuration
-hash.
+```mermaid
+flowchart LR
+    A[Production traces] --> B[Ingestion]
+    B --> C[(SQLite)]
+    C --> D[TF-IDF / KMeans]
+    D --> E[Versioned evaluation dataset]
+    E --> F[Baseline and candidate runs]
+    F --> G[Deterministic scorers and rubric judge]
+    G --> H[Comparison]
+    H --> I[Mode and slice analysis]
+    I --> J[Regression gate]
+    J --> K[CLI]
+    J --> L[JSON detail export]
+    J --> M[CI release gate]
+    L --> N[Streamlit explorer]
+```
 
-Experiment status and verdict are separate. A completed gate decision has status
-`completed` and verdict `PASS` or `FAIL`. An operationally failed attempt has status
-`failed` and a null verdict. Exit codes are:
+Ingestion is the only path that creates trace records. Dataset construction
+snapshots source inputs and slice provenance before sealing the case set.
+Providers run outside database write locks; normalized run, case, judge, and gate
+rows are committed in short transactions. Reports are reconstructed from those
+rows, then exported as the dashboard boundary. More detail is in
+[docs/architecture.md](docs/architecture.md).
+
+## Core features
+
+- JSONL trace ingestion with duplicate and invalid-record handling.
+- Deterministic TF-IDF/KMeans clustering, named slices, and reproducible sampling.
+- Strict schema-versioned case-file overrides for mixed evaluation datasets.
+- Stable UUID5 dataset/case identities, sealed slice provenance, and answer-leak
+  prevention for deterministic and rubric cases.
+- Fixture providers for baseline, candidate, and judge roles, with immutable
+  rubric-result caching and review escalation.
+- Persisted comparison reports with global, mode, and slice aggregates.
+- Exit-code release gates and a strict read-only `ExperimentDetail` export.
+- Optional Ollama-compatible local execution with versioned prompts.
+- A Streamlit explorer that presents persisted results without owning evaluation
+  logic.
+
+## Quick start
+
+The shortest verified path from a clean clone to a successful CLI evaluation is
+the CI-safe Northstar fixture run:
+
+```powershell
+git clone https://github.com/JayPrograms/tracebench.git
+cd tracebench
+py -3.13 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e ".[dev]"
+$demoDb = ".tracebench/northstar-support-ci.sqlite3"
+python scripts/bootstrap_customer_support_demo.py --database $demoDb --force
+$env:TRACEBENCH_DB_PATH = $demoDb
+tracebench experiment run demos/customer-support/experiment.ci-pass.yaml --json
+```
+
+The final command prints a completed `PASS` report and exits `0`. On a
+POSIX shell, use `python3.13 -m venv .venv`, `source .venv/bin/activate`, and
+`export TRACEBENCH_DB_PATH=.tracebench/northstar-support-ci.sqlite3`.
+
+## Customer-support benchmark
+
+Read the detailed [Northstar demo guide](demos/customer-support/README.md) for
+the frozen selected trace IDs, slice-manifest hash, fixture commands, expected
+transitions, cache behavior, case-file contract, and optional Ollama YAML.
+
+The thin bootstrap wrapper calls the public TraceBench CLI to ingest all 35
+traces, cluster them, apply the seven labels, and build the sealed dataset. It
+does not write demo-only SQLite rows.
+
+## Running an evaluation
+
+For the small checked-in sample, create a dataset and promote cases through the
+CLI:
+
+```powershell
+$env:TRACEBENCH_DB_PATH = ".tracebench/core-loop.sqlite3"
+tracebench ingest datasets/traces.sample.jsonl
+tracebench dataset create `
+  --name core-eval `
+  --version 0.1 `
+  --description "Core evaluation-loop sample"
+tracebench dataset add-trace `
+  --dataset core-eval:0.1 `
+  --trace-id sample-001 `
+  --mode deterministic `
+  --scorer-file datasets/scorer.exact-match.json `
+  --scorer-file datasets/scorer.contains.json
+tracebench experiment run datasets/core-evaluation.sample.yaml --json
+```
+
+An experiment YAML names the dataset, baseline and candidate providers, optional
+judge, and gate thresholds. Provider fixture files are strict JSONL envelopes:
+
+```json
+{"eval_id":"eval_...","output":"provider output"}
+```
+
+Duplicate, missing, or unknown evaluation IDs fail preflight before an attempt is
+created. Fixture paths are resolved relative to the YAML file. Reference cases
+use case-sensitive exact matching; deterministic cases support `exact_match`,
+`contains`, `regex`, `json_validity`, and `required_keys`; rubric cases use the
+configured judge and versioned prompts.
+
+Every accepted preflight creates a new attempt. Names are labels, not resumable
+jobs. Configuration hashes are deterministic for the same dataset, fixtures,
+scorers, prompts, and thresholds.
+
+## Regression gates
+
+Gates compare baseline and candidate scores globally and by evaluation mode. A
+slice-built dataset also records numeric cluster selectors and label snapshots,
+so optional `by_slice` limits remain stable if a label is renamed later. Threshold
+comparisons use unrounded values and pass at exact equality.
 
 | Exit | Meaning |
 | ---: | --- |
-| `0` | Completed and passed the regression gate |
-| `1` | Completed and failed the regression gate |
-| `2` | Usage or preflight validation error; no attempt was persisted |
-| `3` | Operational failure; an accepted attempt is marked failed when possible |
+| `0` | Completed evaluation passed the configured gate. |
+| `1` | Completed evaluation failed the configured gate; this is an intentional release decision, not an operational error. |
+| `2` | Usage or preflight validation error; no attempt was persisted. |
+| `3` | Operational failure; an accepted attempt is marked failed when possible. |
 
-Baseline results, candidate results, and comparison/gate results use separate
-transactions. A failed stage rolls back its partial scored rows; a follow-up
-transaction records the operational failure. Raw judge attempts use independent
-audit transactions so malformed responses remain inspectable after a failed run.
-Judge cache lookups and inserts also use short transactions that never remain open
-while waiting for a provider. Machine-readable reports are reconstructed from
-normalized SQLite rows.
+Baseline, candidate, and comparison/gate stages use separate transactions. A
+failed stage rolls back partial scored rows, then records the operational failure
+in a follow-up transaction. Judge attempts and cache operations use short audit
+transactions and never hold a write lock while waiting for a provider.
 
-## Rubric judging
+## Local LLM evaluation
 
-An experiment containing rubric cases requires one judge configuration shared by
-the baseline and candidate runs. This local fixture example is suitable for tests
-and CI:
-
-```yaml
-schema_version: 1
-name: rubric-check
-dataset: support-eval:0.1
-baseline: {provider: fixture, path: support-baseline.jsonl}
-candidate: {provider: fixture, path: support-candidate.jsonl}
-judge:
-  provider: fixture
-  path: support-judge.jsonl
-  prompt_version: rubric-v1
-  prompt_file: ../prompts/judges/rubric-v1.txt
-  retry_prompt_file: ../prompts/judges/rubric-retry-v1.txt
-  confidence_threshold: 0.7
-gate:
-  max_score_drop: 0
-  max_new_failures: 0
-```
-
-The checked-in primary prompt is `prompts/judges/rubric-v1.txt`. Prompt paths are
-resolved relative to the experiment YAML and preflighted like answer-provider
-prompts. Prompt version, content hashes, judge settings, and the finite
-`confidence_threshold` in the inclusive range `[0,1]` contribute to the
-configuration hash. A result below the threshold requires human review but does
-not alter scores, gates, retries, verdicts, or exit codes.
-
-Judge fixtures contain one strict JSONL record for each rubric case and role. A
-second raw output is optional and is consumed only when the first response is
-malformed:
-
-```json
-{"eval_id":"eval_...","role":"baseline","outputs":["raw response","optional retry response"]}
-```
-
-The judge must return JSON only:
-
-```json
-{"schema_version":1,"criteria":[{"criterion":"Exact rubric criterion text","score":1.0,"passed":true,"reason":"Concise reason"}],"overall_score":1.0,"overall_passed":true,"confidence":0.9}
-```
-
-Scores and confidence are finite numbers in `[0,1]`. Criteria must exactly cover
-the stored rubric text without missing, unknown, or duplicate entries. TraceBench
-uses the equal-weight mean of criterion scores as the case score and requires
-`overall_score` to match within an absolute tolerance of `0.000001` with no
-relative tolerance. A case passes only when every criterion passes, and the
-returned `overall_passed` must agree.
-
-Each criterion appears in the existing nonempty scorer-result list with scorer
-name `rubric`. The additive rubric-only `judge` result contains the validated
-overall fields, confidence, threshold diagnostic, attempt count, cache metadata,
-and review state. `cache_hit` is always `true` or `false` for a new result; an
-in-place migration represents historical A2 results with `null`. Cache hits have
-zero attempts because no provider call occurs. Existing deterministic/reference
-JSON case objects, the top-level report schema version, and operational-failure
-JSON remain unchanged at version `1`. Raw judge outputs, cached response content,
-validation failures, latency, and provider metadata remain database-only.
-
-Successful rubric responses are cached by a SHA-256 identity covering the exact
-evaluated output, ordered rubric, other rendered judge inputs, prompt version and
-content hashes, judge model/provider identity, and every configured setting that
-affects generation. Confidence threshold and timeout are excluded because they do
-not affect a successful generation. Threshold changes can therefore reuse a
-response while deriving a new review state.
-
-Each immutable cache entry retains both the exact successful provider output and a
-canonical parsed response. `response_hash` is the SHA-256 hash of the canonical
-parsed JSON, not the raw string. Every hit validates the key identity, canonical
-JSON, hash, and that the retained raw output strictly parses into the same
-canonical response. Any mismatch is an operational integrity failure; TraceBench
-does not overwrite the entry or fall back to the provider. Malformed outputs and
-provider failures are never cached. When a malformed first response is repaired,
-only the exact successful retry output enters the cache.
-
-Concurrent callers may both observe a miss and generate without holding a
-database write lock. The first valid cache insert wins immutably for future hits.
-If another caller produced a different valid response, its run remains a miss and
-uses its own audited response; it does not claim that the winning cache row was
-the source of its result.
-
-Rubric results use the review states `not_required`, `needs_review`, and
-`reviewed`. Low confidence or failure of a `critical`-priority case produces
-`needs_review`, with both reasons retained when applicable. `reviewed` is reserved
-for a future review-editing workflow; this release adds no review-editing command
-or UI.
-
-Malformed judge JSON, schema violations, criterion coverage errors, or inconsistent
-overall fields receive at most one retry using the separately versioned retry
-prompt. Configuration, transport, timeout, provider-envelope, persistence, and
-low-confidence outcomes are never retried. Exhausting the retry is an operational
-failure with exit `3` and a null verdict.
-
-## Local model execution with Ollama
-
-An experiment role may use an Ollama-compatible local server instead of a fixture.
-TraceBench does not install or start Ollama and does not download models. Install
-Ollama, start it, and pull the selected model yourself before running the
-experiment. No API key or authentication configuration is supported.
-
-Store the versioned system prompt in a UTF-8 text file, for example
-`prompts/support-answer-v1.txt`, and reference it from the experiment YAML:
-
-```yaml
-schema_version: 1
-name: local-support-check
-dataset: support-eval:0.1
-baseline:
-  provider: fixture
-  path: support-baseline.jsonl
-candidate:
-  provider: ollama
-  base_url: http://localhost:11434
-  model: llama3.2:3b
-  prompt_version: support-answer-v1
-  system_prompt_file: ../prompts/support-answer-v1.txt
-  temperature: 0
-  timeout_seconds: 120
-  seed: 42
-gate:
-  max_score_drop: 0
-  max_new_failures: 0
-```
-
-Relative prompt paths are resolved from the experiment YAML directory. Prompt
-files may be UTF-8 with or without a byte-order mark and must contain nonblank
-text. TraceBench reads and validates them during preflight, before creating an
-experiment attempt or contacting Ollama. A missing, unreadable, invalidly encoded,
-or blank prompt therefore exits `2` and persists no attempt.
-
-The provider snapshot records `prompt_version` and a SHA-256 hash of the decoded
-prompt contents, not the prompt path or contents. Changing the prompt text changes
-the experiment configuration hash; moving an identical file does not. Generation
-requests append the evaluation input and canonical JSON context using fixed
-TraceBench delimiters and use Ollama's non-streaming `/api/generate` endpoint.
-
-Successful case rows record client-observed generation latency and selected
-Ollama response metadata, including model, termination, duration, and token-count
-fields when returned. These internal persistence additions do not change the
-current human report or `--json` schema. Connection failures, timeouts, HTTP
-errors, and invalid responses are operational failures with exit `3`; TraceBench
-does not retry, start a server, pull a missing model, or select a fallback model.
-
-By default, TraceBench stores data in `.tracebench/tracebench.sqlite3` relative
-to the current directory. Override the location for tests or local workflows
-with `TRACEBENCH_DB_PATH`:
+The optional Ollama provider targets a local server; TraceBench does not install
+or start Ollama, pull models, provide authentication, or contact a hosted
+service. Install Ollama and pull a model yourself, then use the checked-in
+versioned configuration:
 
 ```powershell
-$env:TRACEBENCH_DB_PATH = "C:\path\to\tracebench.sqlite3"
-tracebench ingest datasets/traces.sample.jsonl
-tracebench traces list
+ollama pull llama3.2:3b
+tracebench experiment run demos/customer-support/experiment.ollama.yaml
 ```
 
-## Local installation
+`baseline-v1.txt`, `candidate-v2.txt`, and the rubric judge prompts are hashed
+into the configuration identity. Prompt paths are preflighted before any network
+call. Connection failures, timeouts, HTTP errors, and malformed responses are
+operational failures with exit `3`; there is no fallback model.
 
-TraceBench requires Python 3.13. From the repository root, activate the existing
-virtual environment and install the package with its development dependencies:
+## Clustering and slices
 
 ```powershell
-.\.venv\Scripts\Activate.ps1
-python --version
+tracebench traces cluster --name support-slices-v1 --clusters 6
+tracebench slices list support-slices-v1
+tracebench slices rename support-slices-v1 0 refunds
+tracebench dataset build `
+  --name support-eval `
+  --version 0.2 `
+  --from-slices support-slices-v1 `
+  --size 30 `
+  --case-file demos/customer-support/cases.json
+```
+
+The sampler uses deterministic trace ordering, fixed seeds, balanced round-robin
+quotas, persisted priority signals, and stable SHA-256 ranks. A strict case file
+can override only sampled traces as reference, deterministic, or rubric cases;
+unselected overrides, duplicate keys, unsupported schema versions, and invalid
+mode settings fail atomically. Deterministic and rubric cases omit source
+responses and reference answers. Slice-built datasets are sealed and cannot be
+extended with `dataset add-trace`.
+
+Assignment equivalence is not promised across scikit-learn, NumPy, SciPy,
+platform, or numerical-runtime versions. The frozen Northstar workflow pins the
+compatible stack in `.github/constraints-ci.txt` and asserts the sampling
+manifest in tests.
+
+Trace-only databases are initialized with the current evaluation schema when
+opened. Databases created by the earlier, unmerged evaluation-dataset prototype
+are incompatible because they contain random identities and lack the final
+provenance columns and integrity constraints; reingest the original trace JSONL
+and recreate datasets in a new database rather than attempting an in-place repair.
+
+## Experiment-detail exports
+
+Export a persisted attempt by ID, including when its gate returns exit `1`:
+
+```powershell
+$report = tracebench experiment run `
+  demos/customer-support/experiment.fixture.yaml --json
+$report | Set-Content .tracebench/last-report.json
+$experimentId = ($report | ConvertFrom-Json).experiment_id
+tracebench experiment export $experimentId `
+  --output .tracebench/experiment-detail.json
+```
+
+The versioned export joins the authoritative report with dataset cases, slice
+provenance, provider snapshots, run lifecycle metadata, generation observations,
+and baseline/candidate case rows. It is finite-number JSON, read-only, and
+atomic on replacement. It omits raw judge attempts, malformed responses,
+system-prompt contents, and credential-like metadata. The machine report is the
+compact release contract; `ExperimentDetail` is the richer inspection contract.
+
+Exports may contain customer-support prompts, contexts, outputs, and reference
+answers. Treat them as sensitive, keep them private, and never commit generated
+reports or databases.
+
+## CI integration
+
+The [CI workflow](.github/workflows/ci.yml) installs the development and optional
+dashboard dependencies under the checked-in constraints, then runs Ruff format,
+Ruff lint, mypy, and the full test suite on Python 3.13.
+
+The [Evaluation Gate workflow](.github/workflows/eval-gate.yml) installs only the
+core development extra, builds a fresh Northstar database, runs the separate
+CI-safe candidate, verifies `PASS`, and uploads the
+`northstar-support-ci-report` JSON artifact. It never uses the intentionally
+failing showcase fixture.
+
+## Design decisions
+
+- **Local-first SQLite:** the normalized standard-library store is inspectable,
+  transactional, and works without a hosted dependency.
+- **Fixture-first CI:** deterministic providers make release gating reproducible;
+  Ollama remains an opt-in local integration.
+- **Normalized persisted results:** run, case, judge, cache, and gate rows are the
+  source of truth; reports are reconstructed instead of persisted as a second
+  mutable authority.
+- **Immutable provenance and cache:** dataset/case identities, slice snapshots,
+  configuration hashes, and successful judge responses are auditable and never
+  silently overwritten.
+- **Short write transactions:** no database write lock remains open while a
+  provider or judge is running.
+- **Strict schemas and boundaries:** Pydantic models validate inputs and exports;
+  transaction boundaries distinguish preflight, completed gate decisions, and
+  operational failures.
+- **Thin UI:** Streamlit consumes `ExperimentDetail`; it contains no scorer,
+  judge, threshold, or SQLite evaluation logic.
+
+## Limitations
+
+- Hosted-provider authentication and distributed workers are not implemented.
+- There is no vector database or review-editing workflow.
+- Fixture-provider latency is intentionally unavailable because it is not
+  representative.
+- Clustering equivalence depends on the numerical environment and pinned versions.
+- The Streamlit explorer is read-only and local; hosted deployment is not complete.
+- Exports can contain sensitive trace data and require the same care as source
+  logs.
+
+## Development
+
+TraceBench requires Python 3.13. From the repository root:
+
+```powershell
 python -m pip install -e ".[dev]"
-```
-
-The Python version should be `3.13.x`. Verify the installed CLI:
-
-```powershell
-tracebench version
-```
-
-## Validation
-
-Run formatting, linting, type checking, and tests from the repository root:
-
-```powershell
 ruff format --check .
 ruff check .
 mypy src
 pytest
 ```
 
-The same commands run in `.github/workflows/ci.yml`. The evaluation workflow is
-in `.github/workflows/eval-gate.yml`; its machine-readable passing report is
-uploaded as the `northstar-support-ci-report` artifact.
+Install `.[dev,dashboard]` to run the Streamlit tests and local explorer. The
+repository intentionally excludes `.venv`, `.env`, SQLite files, caches, model
+files, and generated reports. See [docs/demo-script.md](docs/demo-script.md) for
+the recording script, recruiter summary, interview notes, and the remaining
+hosted-dashboard path.
