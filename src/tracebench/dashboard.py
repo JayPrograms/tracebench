@@ -163,7 +163,7 @@ def load_detail_file(path: Path) -> ExperimentDetail:
         payload = path.read_bytes()
     except OSError as error:
         raise DashboardLoadError(
-            f"Could not read report file `{path}`: {error}", kind="unreadable"
+            f"Could not read report file `{path.name}`: {error}", kind="unreadable"
         ) from error
     return load_detail_json(payload)
 

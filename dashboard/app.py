@@ -81,10 +81,10 @@ def _load_from_ui() -> tuple[ExperimentDetail | None, str]:
     if selected_path is None:
         return None, ""
     try:
-        return load_detail_file(selected_path), str(selected_path)
+        return load_detail_file(selected_path), selected_path.name
     except DashboardLoadError as error:
         _render_load_error(error)
-        return None, str(selected_path)
+        return None, selected_path.name
 
 
 def _render_load_error(error: DashboardLoadError) -> None:

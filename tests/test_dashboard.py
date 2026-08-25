@@ -236,5 +236,6 @@ def test_streamlit_smoke_renders_empty_invalid_and_valid_states(
     monkeypatch.setenv("TRACEBENCH_REPORT_PATH", str(valid_path))
     valid = AppTest.from_file(str(APP_PATH), default_timeout=30).run()
     assert valid.success
+    assert all(str(valid_path) not in item.value for item in valid.success)
     assert any("FAIL" in item.value for item in valid.error)
     assert any("Unavailable for fixture providers" in item.value for item in valid.info)
