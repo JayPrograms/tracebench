@@ -74,6 +74,29 @@ file private and out of version control. The machine report remains the compact
 automation/release-gate contract, while this detail document is the shared input
 for the later reporting and dashboard layers.
 
+## Open the local result explorer
+
+Install the optional dashboard dependency and prepare a fresh failing detail
+export without writing directly to SQLite:
+
+```powershell
+python -m pip install -e ".[dev,dashboard]"
+python scripts/prepare_customer_support_dashboard.py `
+  --output .tracebench/northstar-detail.json --overwrite
+streamlit run dashboard/app.py
+```
+
+The app can also load a different export through the file uploader, the
+`TRACEBENCH_REPORT_PATH` environment variable, or
+`streamlit run dashboard/app.py -- --report path`. It is a read-only consumer of
+strict `ExperimentDetail` JSON: persisted scores, transitions, slice
+aggregates, gate violations, review reasons, cache state, and provider metadata
+are displayed without opening the database or re-running evaluation. Fixture
+latency is shown as unavailable because it is not representative. Raw judge
+attempts and prompts are intentionally absent from the detail export. Exports
+may contain sensitive support data, so keep them private. Hosted deployment and
+authentication are deferred.
+
 The bootstrap script is a thin cross-platform wrapper around the real
 TraceBench CLI. It ingests the checked-in traces, clusters them, applies the
 seven checked-in labels, and builds the sealed dataset; it never writes SQLite

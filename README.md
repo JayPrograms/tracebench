@@ -365,6 +365,36 @@ data; treat exports as sensitive trace artifacts and do not commit them. The
 machine report is the compact release-gate contract; the detail export is the
 future dashboard's richer inspection document.
 
+## Local result explorer
+
+Install the optional dashboard extra when you want the read-only Streamlit
+explorer; the core package and CI-safe fixture workflow do not require it:
+
+```powershell
+python -m pip install -e ".[dev,dashboard]"
+python scripts/prepare_customer_support_dashboard.py `
+  --output .tracebench/northstar-detail.json --overwrite
+streamlit run dashboard/app.py
+```
+
+The preparation script builds a fresh Northstar database through the public
+CLI, runs the intentional failing fixture, exports the strict
+`ExperimentDetail` document, and validates its `FAIL` verdict. It uses a
+temporary database unless `--database` is supplied; no generated database or
+report belongs in version control. The app also accepts
+`TRACEBENCH_REPORT_PATH` or `streamlit run dashboard/app.py -- --report path`.
+An uploaded JSON file must validate against the supported detail schema; empty,
+invalid, unsupported-version, and unreadable states are explained in the UI.
+
+The explorer never queries SQLite, rescores, recalculates, applies thresholds,
+changes persisted verdicts, or writes data. Scores, transitions, slice rows,
+gate violations, review reasons, and latency observations are read from the
+export. Fixture-provider latency is explicitly shown as unavailable because
+fixture timing is not representative. Detail exports can contain customer
+prompts, contexts, outputs, and reference answers; treat them as sensitive and
+keep them private. Hosted deployment and authentication are intentionally
+deferred to a later checkpoint.
+
 Every successful preflight creates a new experiment attempt. Names are reusable
 labels, so rerunning the same name never overwrites or resumes an earlier attempt.
 Every attempt receives a new ID; behaviorally identical dataset definitions,
