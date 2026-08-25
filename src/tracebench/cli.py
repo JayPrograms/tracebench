@@ -46,6 +46,7 @@ from tracebench.models import (
     ScorerConfig,
     Trace,
 )
+from tracebench.reporting import ExperimentDetailError, export_experiment_detail
 from tracebench.storage import (
     connect_database,
     list_traces,
@@ -492,6 +493,27 @@ def run_experiment_command(
         raise typer.Exit(code=1)
 
 
+@experiment_app.command("export")
+def export_experiment_command(
+    experiment_id: Annotated[str, typer.Argument(help="Persisted experiment ID.")],
+    output: Annotated[Path, typer.Option(help="Destination UTF-8 JSON detail file.")],
+    overwrite: Annotated[
+        bool, typer.Option(help="Replace an existing output file.")
+    ] = False,
+) -> None:
+    """Export a persisted experiment detail for dashboards and automation."""
+    try:
+        export_experiment_detail(
+            resolve_database_path(),
+            experiment_id,
+            output,
+            overwrite=overwrite,
+        )
+    except (ExperimentDetailError, OSError, sqlite3.Error, ValueError) as error:
+        _exit_experiment_export_error(error)
+    typer.echo(f"Exported experiment detail {experiment_id} to {output}.")
+
+
 def _print_ingestion_summary(summary: IngestionSummary) -> None:
     typer.echo(f"Records read: {summary.records_read}")
     typer.echo(f"Records accepted: {summary.records_accepted}")
@@ -789,6 +811,12 @@ def _exit_dataset_error(error: BaseException) -> Never:
 def _exit_clustering_error(error: BaseException) -> Never:
     typer.echo(f"Error: {error}", err=True)
     raise typer.Exit(code=1) from error
+
+
+def _exit_experiment_export_error(error: BaseException) -> Never:
+    """Render export IDs and paths as usage/preflight failures."""
+    typer.echo(f"Error: {error}", err=True)
+    raise typer.Exit(code=2) from error
 
 
 def _exit_usage_error(message: str) -> Never:

@@ -56,6 +56,24 @@ Both experiment commands intentionally exit `1` because the completed release
 gate verdict is `FAIL`. Exit `1` is a regression decision, not an operational
 error. The first run records 14 judge-cache misses; the second records 14 hits.
 
+To inspect one attempt in a future dashboard, capture its ID from the JSON
+report and export the shared detail document:
+
+```powershell
+$report = tracebench experiment run demos/customer-support/experiment.fixture.yaml --json
+$experimentId = ($report | ConvertFrom-Json).experiment_id
+tracebench experiment export $experimentId --output .tracebench/northstar-detail.json
+```
+
+The export includes the persisted dataset and slice provenance, provider/run
+metadata, generation observations, and combined case results while reusing the
+machine report's authoritative scores and gate. It excludes raw judge attempts,
+malformed judge responses, and system-prompt contents. Prompts, contexts,
+outputs, and reference answers are customer-support trace data; keep the JSON
+file private and out of version control. The machine report remains the compact
+automation/release-gate contract, while this detail document is the shared input
+for the later reporting and dashboard layers.
+
 The bootstrap script is a thin cross-platform wrapper around the real
 TraceBench CLI. It ingests the checked-in traces, clusters them, applies the
 seven checked-in labels, and builds the sealed dataset; it never writes SQLite

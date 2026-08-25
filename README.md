@@ -343,6 +343,28 @@ comparison `by_slice` transitions. Experiments on ordinary datasets continue to
 emit the unchanged schema-version-`1` shape. Human reports add a numeric-order
 slice table only for slice-aware experiments.
 
+Export a read-only, dashboard-ready detail document for a persisted attempt. The
+experiment ID is available from the stable `--json` output even when the gate
+returns exit `1`:
+
+```powershell
+$result = tracebench experiment run demos/customer-support/experiment.fixture.yaml --json
+$result | Set-Content .tracebench/last-report.json
+$experimentId = ($result | ConvertFrom-Json).experiment_id
+tracebench experiment export $experimentId --output .tracebench/experiment-detail.json
+```
+
+The detail export is versioned JSON and joins the authoritative report with
+dataset cases, slice provenance, provider snapshots, run lifecycle metadata,
+generation observations, and baseline/candidate case rows. It is deterministic,
+read-only, finite-number JSON, and protects an existing destination unless
+`--overwrite` is supplied. It intentionally omits raw judge attempts, malformed
+responses, authentication-like values, and system-prompt contents. Case inputs,
+contexts, outputs, and reference answers may contain sensitive customer-support
+data; treat exports as sensitive trace artifacts and do not commit them. The
+machine report is the compact release-gate contract; the detail export is the
+future dashboard's richer inspection document.
+
 Every successful preflight creates a new experiment attempt. Names are reusable
 labels, so rerunning the same name never overwrites or resumes an earlier attempt.
 Every attempt receives a new ID; behaviorally identical dataset definitions,
