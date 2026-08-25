@@ -5,6 +5,8 @@ Local-first regression testing for LLM applications.
 [![CI](https://github.com/JayPrograms/tracebench/actions/workflows/ci.yml/badge.svg)](https://github.com/JayPrograms/tracebench/actions/workflows/ci.yml)
 [![Evaluation Gate](https://github.com/JayPrograms/tracebench/actions/workflows/eval-gate.yml/badge.svg)](https://github.com/JayPrograms/tracebench/actions/workflows/eval-gate.yml)
 
+[Live dashboard](https://tracebench-northstar.streamlit.app/)
+
 TraceBench compares a baseline and candidate model, prompt, or application
 configuration; scores their answers with reference, deterministic, and rubric
 evaluations; and blocks a release when configured regression thresholds fail.
@@ -63,9 +65,11 @@ streamlit run dashboard/app.py
 ```
 
 The app also accepts `TRACEBENCH_REPORT_PATH`, `-- --report path`, or a JSON
-upload. Treat exports as sensitive trace artifacts: they can contain prompts,
-contexts, outputs, and reference answers. Hosted deployment and authentication
-are intentionally deferred; see [Hosted dashboard strategy](docs/demo-script.md#hosted-dashboard-strategy).
+upload. The [live dashboard](https://tracebench-northstar.streamlit.app/)
+starts from the reviewed synthetic Northstar FAIL snapshot and performs no model
+calls, evaluation, clustering, or SQLite writes. Treat local exports as sensitive
+trace artifacts: they can contain prompts, contexts, outputs, and reference
+answers. See [Hosted dashboard strategy](docs/demo-script.md#hosted-dashboard-strategy).
 
 ## How it works
 
@@ -309,7 +313,8 @@ failing showcase fixture.
 - Fixture-provider latency is intentionally unavailable because it is not
   representative.
 - Clustering equivalence depends on the numerical environment and pinned versions.
-- The Streamlit explorer is read-only and local; hosted deployment is not complete.
+- The Streamlit explorer is read-only. The public preview uses only the reviewed
+  synthetic Northstar snapshot; it does not run providers or evaluation jobs.
 - Exports can contain sensitive trace data and require the same care as source
   logs.
 
@@ -328,5 +333,5 @@ pytest
 Install `.[dev,dashboard]` to run the Streamlit tests and local explorer. The
 repository intentionally excludes `.venv`, `.env`, SQLite files, caches, model
 files, and generated reports. See [docs/demo-script.md](docs/demo-script.md) for
-the recording script, recruiter summary, interview notes, and the remaining
-hosted-dashboard path.
+the recording script, recruiter summary, interview notes, and hosted-dashboard
+deployment notes.

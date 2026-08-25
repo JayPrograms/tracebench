@@ -99,6 +99,9 @@ authentication are not required for the reviewed hosted snapshot.
 
 ## Reviewed hosted snapshot
 
+Try the [public TraceBench dashboard](https://tracebench-northstar.streamlit.app/)
+to inspect this snapshot without uploading a report.
+
 The default hosted configuration loads the reviewed hosted snapshot at
 `demos/customer-support/hosted/northstar-fail-detail.json`. It contains only
 synthetic Northstar data, validates as schema-version-1 `ExperimentDetail`, and

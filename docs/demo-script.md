@@ -160,23 +160,20 @@ transaction with rollback on partial failure.
 
 ## Hosted dashboard strategy
 
-Deployment is intentionally not part of this checkpoint. The reliable next path
-is a deterministic, read-only artifact flow:
+The [public Northstar dashboard](https://tracebench-northstar.streamlit.app/)
+uses a deterministic, read-only artifact flow:
 
-1. A hosted build job runs `scripts/prepare_customer_support_dashboard.py` in an
-   ephemeral workspace. The script calls the authoritative CLI/bootstrap path; it
-   does not duplicate scoring or write demo-only rows.
-2. The job validates the resulting `ExperimentDetail` schema and `FAIL`/`PASS`
-   status, then publishes the export as a short-retention, access-controlled
-   artifact or object. Cache the build by commit plus fixture/configuration hashes;
-   do not rebuild on every browser request.
-3. Streamlit receives that export through a protected artifact download or a user
-   upload and remains a read-only `ExperimentDetail` consumer. It does not receive
-   a SQLite database, run Ollama, or hold API keys.
-4. Before a public deployment, add authentication/authorization, retention and
-   redaction policy, artifact size limits, and an explicit warning that trace
-   prompts and outputs can be sensitive. Keep generated databases/reports out of
-   Git and preserve the current AGENTS.md restrictions.
+1. The reviewed `demos/customer-support/hosted/northstar-fail-detail.json`
+   snapshot is validated as strict `ExperimentDetail` data and contains only
+   synthetic Northstar support data.
+2. Streamlit consumes that snapshot and remains a read-only
+   `ExperimentDetail` consumer. It does not receive a SQLite database, run
+   Ollama, make model calls, or hold API keys.
+3. Local uploads and exports remain supported for private review, but they may
+   contain sensitive prompts, contexts, outputs, and reference answers. Keep
+   those files out of Git and preserve the narrow AGENTS.md snapshot exception.
 
-This approach keeps the UI thin, makes the hosted demo reproducible, and avoids
-claiming that a fixture report is live production telemetry.
+The public URL is a preview of the synthetic fixture, not live production
+telemetry. Moving it from `feature/productization` to `main` only requires
+changing the app's selected branch in Streamlit settings; the custom subdomain
+can remain unchanged.
