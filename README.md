@@ -136,6 +136,16 @@ seven named slices, a mixed-mode 21-case dataset, deterministic baseline,
 candidate, and judge fixtures, an intentional failed release gate, judge-cache
 reuse, and an optional Ollama-compatible configuration.
 
+The repository's `CI` workflow runs formatting, linting, type checking, and the
+full test suite. The separate `Evaluation gate` workflow uses only checked-in
+fixtures: it bootstraps a fresh 35-trace database, builds the exact 21-case
+dataset, and runs `experiment.ci-pass.yaml`. That candidate preserves the demo
+improvements without regressions, so a completed `PASS` returns exit `0`.
+The intentionally regressing `experiment.fixture.yaml` remains a local
+showcase and returns exit `1`; it is not the normal CI gate. Both workflows use
+`.github/constraints-ci.txt` to keep the numerical clustering stack aligned
+with the frozen sampling manifest.
+
 Create an independent dataset version:
 
 ```powershell
@@ -541,3 +551,7 @@ ruff check .
 mypy src
 pytest
 ```
+
+The same commands run in `.github/workflows/ci.yml`. The evaluation workflow is
+in `.github/workflows/eval-gate.yml`; its machine-readable passing report is
+uploaded as the `northstar-support-ci-report` artifact.

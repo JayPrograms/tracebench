@@ -6,7 +6,8 @@ it weakens billing, cancellation, and refund-policy behavior. The critical
 refund regression blocks the release.
 
 The checked-in fixture workflow is deterministic and requires no model server.
-The optional Ollama configuration runs the same dataset through local models.
+The CI-safe fixture uses a second candidate and judge fixture, while the
+optional Ollama configuration runs the same dataset through local models.
 
 ## What the demo covers
 
@@ -40,30 +41,7 @@ activated:
 
 ```powershell
 $demoDb = ".tracebench/northstar-support.sqlite3"
-if (Test-Path -LiteralPath $demoDb) {
-  Remove-Item -LiteralPath $demoDb
-}
-$env:TRACEBENCH_DB_PATH = $demoDb
-
-tracebench ingest demos/customer-support/traces.jsonl
-tracebench traces cluster `
-  --name northstar-support-slices-v1 `
-  --clusters 7
-
-tracebench slices rename northstar-support-slices-v1 0 account-security
-tracebench slices rename northstar-support-slices-v1 1 billing-invoices
-tracebench slices rename northstar-support-slices-v1 2 cancellation-retention
-tracebench slices rename northstar-support-slices-v1 3 delivery-tracking
-tracebench slices rename northstar-support-slices-v1 4 refund-policy
-tracebench slices rename northstar-support-slices-v1 5 returns-exchanges
-tracebench slices rename northstar-support-slices-v1 6 product-troubleshooting
-
-tracebench dataset build `
-  --name northstar-support-eval `
-  --version 1.0 `
-  --from-slices northstar-support-slices-v1 `
-  --size 21 `
-  --case-file demos/customer-support/cases.json
+python scripts/bootstrap_customer_support_demo.py --database $demoDb --force
 
 tracebench dataset show northstar-support-eval:1.0
 
@@ -77,6 +55,29 @@ $LASTEXITCODE
 Both experiment commands intentionally exit `1` because the completed release
 gate verdict is `FAIL`. Exit `1` is a regression decision, not an operational
 error. The first run records 14 judge-cache misses; the second records 14 hits.
+
+The bootstrap script is a thin cross-platform wrapper around the real
+TraceBench CLI. It ingests the checked-in traces, clusters them, applies the
+seven checked-in labels, and builds the sealed dataset; it never writes SQLite
+rows directly.
+
+## Run the CI-safe gate
+
+The evaluation workflow uses the passing candidate and judge fixtures below.
+Run the same gate locally after creating a fresh database:
+
+```powershell
+$demoDb = ".tracebench/northstar-support-ci.sqlite3"
+python scripts/bootstrap_customer_support_demo.py --database $demoDb --force
+$env:TRACEBENCH_DB_PATH = $demoDb
+tracebench experiment run demos/customer-support/experiment.ci-pass.yaml --json
+$LASTEXITCODE  # 0; PASS
+```
+
+The CI-safe candidate keeps the delivery and troubleshooting improvements and
+correctly handles billing, cancellation, and refund policy. The showcase
+candidate above deliberately regresses those policies and must remain a local
+failure example; it is never substituted into the release-gate workflow.
 
 ## Expected fixture result
 

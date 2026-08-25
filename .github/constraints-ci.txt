@@ -1,0 +1,8 @@
+# Numerical stack used to freeze the Northstar clustering and sampling manifest.
+# Versions captured from the Python 3.13.3 environment that produced the checked-in
+# manifest. Keep the normal project dependency ranges broad; constrain only CI.
+joblib==1.5.3
+numpy==2.5.2
+scikit-learn==1.9.0
+scipy==1.18.0
+threadpoolctl==3.6.0

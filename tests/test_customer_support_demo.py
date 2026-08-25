@@ -4,10 +4,12 @@ import json
 from collections import Counter
 from contextlib import closing
 from pathlib import Path
+from typing import Any
 
 import pytest
 from typer.testing import CliRunner
 
+import tracebench.experiments as experiment_module
 from tracebench.cli import app
 from tracebench.datasets import get_dataset_details
 from tracebench.experiment_config import prepare_experiment
@@ -18,6 +20,7 @@ from tracebench.storage import connect_database
 REPOSITORY_ROOT = Path(__file__).parents[1]
 DEMO_ROOT = REPOSITORY_ROOT / "demos" / "customer-support"
 FIXTURE_CONFIG = DEMO_ROOT / "experiment.fixture.yaml"
+CI_PASS_CONFIG = DEMO_ROOT / "experiment.ci-pass.yaml"
 OLLAMA_CONFIG = DEMO_ROOT / "experiment.ollama.yaml"
 
 EXPECTED_ASSIGNMENTS = {
@@ -175,6 +178,38 @@ def _assert_report(report: dict[str, object], *, cache_hit: bool) -> None:
     }
 
 
+def test_customer_support_ci_candidate_passes_the_release_gate(tmp_path: Path) -> None:
+    """The normal CI fixture preserves improvements without regressions."""
+    database_path = tmp_path / "northstar-ci.sqlite3"
+    environment = _build_demo(database_path)
+
+    result = runner.invoke(
+        app,
+        ["experiment", "run", str(CI_PASS_CONFIG), "--json"],
+        env=environment,
+    )
+
+    assert result.exit_code == 0, result.output
+    report = json.loads(result.stdout)
+    assert report["status"] == "completed"
+    assert report["verdict"] == "PASS"
+    assert report["gate"] == {"passed": True, "violations": []}
+    assert report["comparison"]["global"] == {
+        "baseline_score": pytest.approx(0.9333333333333333),
+        "candidate_score": pytest.approx(1.0),
+        "case_count": 21,
+        "newly_failed_count": 0,
+        "newly_passed_count": 2,
+        "scope": "global",
+        "score_delta": pytest.approx(0.06666666666666665),
+    }
+    assert report["comparison"]["newly_failed"] == []
+    assert report["comparison"]["newly_passed"] == [
+        EXPECTED_EVAL_IDS["troubleshoot-04"],
+        EXPECTED_EVAL_IDS["delivery-02"],
+    ]
+
+
 def test_customer_support_demo_is_reproducible_and_fails_the_release_gate(
     tmp_path: Path,
 ) -> None:
@@ -247,3 +282,35 @@ def test_customer_support_demo_is_reproducible_and_fails_the_release_gate(
     )
     assert ollama.judge is not None
     assert ollama.judge.snapshot["provider"] == "ollama"
+
+
+def test_demo_usage_and_operational_failures_are_not_regressions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Usage is exit 2 and operational failure is exit 3, not a gate verdict."""
+    database_path = tmp_path / "northstar-errors.sqlite3"
+    environment = _build_demo(database_path)
+
+    usage = runner.invoke(
+        app,
+        ["experiment", "run", str(DEMO_ROOT / "does-not-exist.yaml")],
+        env=environment,
+    )
+    assert usage.exit_code == 2
+    assert "Usage: " in usage.output
+
+    def fail_run(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("injected CI operational failure")
+
+    monkeypatch.setattr(experiment_module, "persist_completed_run", fail_run)
+    operational = runner.invoke(
+        app,
+        ["experiment", "run", str(FIXTURE_CONFIG), "--json"],
+        env=environment,
+    )
+    assert operational.exit_code == 3
+    payload = json.loads(operational.stdout)
+    assert payload["status"] == "failed"
+    assert payload["verdict"] is None
+    assert payload["failure_stage"] == "baseline"
